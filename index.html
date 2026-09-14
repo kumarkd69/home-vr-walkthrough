@@ -33,8 +33,9 @@
     pointer-events:none;text-align:center}
   #hud.hide{display:none}
 
-  #dbg{position:fixed;top:max(8px,env(safe-area-inset-top));left:8px;z-index:5;font-size:11px;
-    background:rgba(0,0,0,.5);padding:4px 8px;border-radius:8px;opacity:.7;pointer-events:none;display:none}
+  #dbg{position:fixed;top:max(8px,env(safe-area-inset-top));left:8px;z-index:5;
+    font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;
+    background:rgba(0,0,0,.5);padding:4px 8px;border-radius:8px;opacity:.75;pointer-events:none;display:none}
 
   #ui{position:fixed;left:0;right:0;bottom:0;padding:10px max(10px,env(safe-area-inset-right)) max(10px,env(safe-area-inset-bottom))
     max(10px,env(safe-area-inset-left));display:flex;gap:8px;flex-wrap:wrap;
@@ -47,12 +48,15 @@
   #exit{position:fixed;top:max(8px,env(safe-area-inset-top));right:max(8px,env(safe-area-inset-right));z-index:8;
     display:none;min-width:auto;padding:10px 16px;background:rgba(20,20,24,.8);border-radius:24px;font-size:13px}
 
-  #settings{position:fixed;right:8px;bottom:70px;z-index:7;width:min(260px,72vw);background:#12151acc;
-    border:1px solid #2a2f38;border-radius:12px;padding:10px 12px;display:none;font-size:12px}
+  #settings{position:fixed;right:8px;bottom:120px;z-index:7;width:min(260px,72vw);background:#12151af2;
+    border:1px solid #2a2f38;border-radius:12px;padding:10px 12px;display:none;font-size:12px;
+    max-height:calc(100vh - 190px);overflow-y:auto;-webkit-overflow-scrolling:touch}
   #settings.show{display:block}
   #settings label{display:flex;justify-content:space-between;gap:8px;margin:6px 0}
   #settings input[type=range]{flex:1}
   #settings h4{margin:2px 0 6px;font-size:12px;opacity:.7}
+  #settings .mono{font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;opacity:.8;
+    white-space:pre-wrap;word-break:break-word;margin:3px 0}
 </style>
 </head>
 <body>
@@ -80,9 +84,14 @@
   <label>Distortion k2 <input id="k2" type="range" min="0" max="0.4" step="0.01"></label>
   <label>Walk speed (m/s) <input id="spd" type="range" min="0.4" max="3" step="0.1"></label>
   <label>Invert look up/down <input id="invPitch" type="checkbox"></label>
-  <h4 style="margin-top:10px">Controller</h4>
-  <div id="padStatus" style="opacity:.75;margin-bottom:4px">No controller detected</div>
-  <label style="justify-content:flex-start;gap:6px"><input id="padTest" type="checkbox"> show raw button/axis test</label>
+  <label>Invert turning <input id="invYaw" type="checkbox"></label>
+  <label>Legacy head tracking <input id="legacyTrack" type="checkbox"></label>
+
+  <h4 style="margin-top:12px">Remote / controller</h4>
+  <div id="padStatus" class="mono">No controller detected</div>
+  <div id="keyLog" class="mono">last key: —</div>
+  <button id="bindBtn" style="width:100%;min-height:40px;margin:6px 0">Learn buttons</button>
+  <div id="bindStatus" class="mono"></div>
 </div>
 
 <div id="ui" class="hide">
@@ -219,22 +228,77 @@ gltfLoader.load(
 );
 
 /* =========================================================================
-   iOS / cross-browser device orientation
+   HEAD TRACKING
+   =========================================================================
+
+   Why this is not the usual three.js DeviceOrientationControls snippet:
+
+   `deviceorientation` reports alpha/beta/gamma — a Z-X'-Y'' Euler
+   decomposition. Every cardboard demo composes those three angles back into
+   a rotation. That works fine for a phone held flat-ish, and breaks badly
+   for a phone lying in a VR headset, because:
+
+     A phone in a headset, in landscape, looking at the horizon sits at
+     beta = 0, gamma = ±90.
+
+   gamma's range is clamped to [-90, 90]. So the resting pose of a headset is
+   exactly ON gamma's boundary, which is also the gimbal-lock configuration
+   of that Euler sequence. Pitch your head up from there and gamma cannot
+   keep going — instead the OS jumps beta by 180° and reflects gamma. The
+   composed rotation whips around, which is precisely the reported
+   "when I look up it switches to the back angle / I can't look up" bug.
+   No amount of smoothing or glitch-rejection fixes that: the representation
+   itself is degenerate there, not the data.
+
+   So instead:
+     * Pitch and roll come from the GRAVITY DIRECTION, computed from beta and
+       gamma only (formula below). Gravity is a physical direction, not a
+       decomposition artifact, so it stays continuous straight through the
+       degenerate pose.
+     * Rotation is carried by integrating the GYROSCOPE
+       (devicemotion.rotationRate) into a quaternion. Integrating angular
+       velocity never decomposes into Euler angles, so it has no singularity
+       anywhere — you can look straight up, straight down, roll over, fine.
+     * Gravity continuously pulls the integrated orientation back to true
+       vertical (complementary filter), killing gyro drift in pitch/roll.
+     * Yaw drift is handled by the Recentre button. alpha/compass is not used
+       at all, which also means indoor magnetic interference can't upset it.
    ========================================================================= */
-let gyroOn = false, usingAbsolute = false, motionDenied = false;
-let alphaOffset = 0;               // recentre offset (radians)
-const devQ = new THREE.Quaternion();       // raw (pre-smoothing) device orientation
-const smoothedQ = new THREE.Quaternion();  // low-pass filtered, glitch-rejected — what the head actually uses
-let smoothedQInit = false;
+
+let gyroOn = false;          // receiving orientation data of some kind
+let gyroAvailable = false;   // devicemotion rotationRate is actually arriving
+let motionDenied = false;
+let legacyTracking = false;  // escape hatch: use the old Euler method
+let invertPitch = false;     // escape hatch for a mirrored pitch axis
+let invertYaw = false;       // escape hatch for a mirrored turn axis
+
+// device frame: X = right of screen, Y = top of screen, Z = out of the screen
+// sensor world frame: X = east, Y = north, Z = up
+const qDS = new THREE.Quaternion();      // device -> sensor world (the fused estimate)
+let qDSInit = false;
+// sensor world -> three.js world (X east, Y up, Z south) is -90° about X
+const qSensorToWorld = new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2);
+const qYawOffset = new THREE.Quaternion();   // set by Recentre
+const legacyQ = new THREE.Quaternion();      // result of the old Euler path
+const headQ = new THREE.Quaternion();        // final composed orientation
+
+const gravDev = new THREE.Vector3(0, 0, -1); // measured "down", in device coords
+let gravValid = false;
+
 const _euler = new THREE.Euler();
-const _q1 = new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2); // -90deg about X: device "world" -> three.js world
-const _q0 = new THREE.Quaternion();
-const _zee = new THREE.Vector3(0,0,1);
+const _zAxis = new THREE.Vector3(0, 0, 1);
+const _yAxis = new THREE.Vector3(0, 1, 0);
+const _omega = new THREE.Vector3();
+const _up    = new THREE.Vector3();
+const _gPred = new THREE.Vector3();
+const _dq    = new THREE.Quaternion();
+const _qa    = new THREE.Quaternion();
+const _qb    = new THREE.Quaternion();
+const _qLegacyBack = new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2);
 
 // screen.orientation.angle can legitimately be 0 (portrait), so don't use `||`
-// chains that treat 0 as "missing" — that was silently falling back to the
-// (differently-signed) legacy window.orientation and could invert pitch/roll
-// depending on which the browser happened to report first.
+// chains that treat 0 as "missing" — that silently fell back to the legacy,
+// oppositely-signed window.orientation.
 function readScreenAngle(){
   if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
   if (typeof window.orientation === 'number') return window.orientation;
@@ -243,83 +307,163 @@ function readScreenAngle(){
 let screenAngle = readScreenAngle();
 addEventListener('orientationchange', ()=>{ screenAngle = readScreenAngle(); });
 
-let invertPitch = false;
-let lastHeadingDeg = 0;
+let lastHeadingDeg = 0, lastBetaDeg = 0, lastGammaDeg = 0;
 
-function handleOrientation(e, absolute){
-  let alphaDeg;
-  if (typeof e.webkitCompassHeading === 'number') {
-    // iOS Safari: webkitCompassHeading is degrees clockwise from magnetic north,
-    // and is already an absolute heading — convert to the same convention as `alpha`.
-    alphaDeg = 360 - e.webkitCompassHeading;
-    absolute = true;
-  } else if (e.alpha != null) {
-    alphaDeg = e.alpha;
-  } else return;
-
-  if (usingAbsolute && !absolute) return;   // prefer the absolute source once we have one
-  if (absolute) usingAbsolute = true;
+/* --- gravity + legacy path, from `deviceorientation` --------------------- */
+function handleOrientation(e){
+  if(e.beta == null && e.gamma == null && e.alpha == null) return;
   gyroOn = true;
-  lastHeadingDeg = alphaDeg;
 
-  const alpha = THREE.MathUtils.degToRad(alphaDeg) + alphaOffset;
-  const beta  = THREE.MathUtils.degToRad(e.beta || 0);
-  const gamma = THREE.MathUtils.degToRad(e.gamma || 0);
-  const orient = THREE.MathUtils.degToRad(screenAngle);
+  const betaDeg  = e.beta  || 0;
+  const gammaDeg = e.gamma || 0;
+  lastBetaDeg = betaDeg; lastGammaDeg = gammaDeg;
+  const b = THREE.MathUtils.degToRad(betaDeg);
+  const g = THREE.MathUtils.degToRad(gammaDeg);
 
-  _euler.set(beta, alpha, -gamma, 'YXZ');
-  devQ.setFromEuler(_euler);
-  devQ.multiply(_q1);
-  devQ.multiply(_q0.setFromAxisAngle(_zee, -orient));
+  // World "down" expressed in device coordinates, derived from the spec's
+  // R = Rz(alpha)·Rx(beta)·Ry(gamma):  g_device = Rᵀ·(0,0,-1).
+  // Note it does not involve alpha at all — rotation about the vertical axis
+  // cannot change which way is down — which is exactly why this stays well
+  // behaved where the full alpha/beta/gamma composition falls apart.
+  gravDev.set(
+     Math.sin(g) * Math.cos(b),
+    -Math.sin(b),
+    -Math.cos(g) * Math.cos(b)
+  ).normalize();
+  gravValid = true;
 
-  if (invertPitch) {
-    // Flip only the pitch (device-local X) axis, after the fact, so this is
-    // a guaranteed-correct fix regardless of which raw sensor convention a
-    // given phone/headset combination produces — see the "Invert look
-    // up/down" toggle in Settings.
-    _euler.setFromQuaternion(devQ, 'YXZ');
-    _euler.x = -_euler.x;
-    devQ.setFromEuler(_euler);
+  if (typeof e.webkitCompassHeading === 'number') lastHeadingDeg = 360 - e.webkitCompassHeading;
+  else if (e.alpha != null) lastHeadingDeg = e.alpha;
+
+  // Legacy Euler path, kept only as a user-selectable fallback.
+  if (e.alpha != null || typeof e.webkitCompassHeading === 'number') {
+    const a = THREE.MathUtils.degToRad(lastHeadingDeg);
+    _euler.set(b, a, -g, 'YXZ');
+    legacyQ.setFromEuler(_euler);
+    legacyQ.multiply(_qLegacyBack);
+    legacyQ.multiply(_qa.setFromAxisAngle(_zAxis, -THREE.MathUtils.degToRad(screenAngle)));
   }
 
-  // --- glitch rejection + smoothing ---------------------------------------
-  // Cheap gyros (and the beta/gamma Euler decomposition itself, which has a
-  // mathematical singularity) occasionally emit one wildly wrong sample —
-  // this is what shows up as a sudden flip/flicker when looking near
-  // straight up or down. Reject a single-frame jump that's implausibly
-  // large, and low-pass filter (slerp) everything else so tracking still
-  // feels responsive but isn't jumpy frame-to-frame.
-  if (!smoothedQInit) {
-    smoothedQ.copy(devQ);
-    smoothedQInit = true;
-  } else {
-    const angleDelta = smoothedQ.angleTo(devQ);
-    if (angleDelta > THREE.MathUtils.degToRad(70)) {
-      // Likely a glitched sample — ignore it, keep last good orientation.
-      return;
-    }
-    smoothedQ.slerp(devQ, 0.35);
-  }
+  if (!qDSInit) { seedFromGravity(); qDSInit = true; }
+  // With no gyro we have to lean on gravity alone for pitch/roll (yaw won't
+  // track in that case — the HUD says so).
+  else if (!gyroAvailable) correctWithGravity(0.35);
 }
-const onAbs = e => handleOrientation(e, true);
-const onRel = e => handleOrientation(e, false);
 
-function attachOrientationListeners(){
-  addEventListener('deviceorientationabsolute', onAbs, true);
-  addEventListener('deviceorientation', onRel, true);
+function seedFromGravity(){
+  qDS.identity();
+  _gPred.set(0, 0, -1);
+  qDS.multiply(_qa.setFromUnitVectors(gravDev, _gPred));
+}
+
+// Rotate the integrated estimate a little way toward agreeing with measured
+// gravity. setFromUnitVectors gives the *minimal* rotation between the two, so
+// it has no component about the vertical axis — i.e. it corrects pitch and
+// roll without ever disturbing yaw.
+function correctWithGravity(strength){
+  if(!gravValid || !qDSInit) return;
+  _gPred.set(0, 0, -1).applyQuaternion(_qa.copy(qDS).invert());
+  _qb.setFromUnitVectors(gravDev, _gPred);
+  if(strength >= 1) qDS.multiply(_qb);
+  else qDS.multiply(_qa.identity().slerp(_qb, strength));
+}
+
+/* --- gyro integration, from `devicemotion` ------------------------------- */
+let lastMotionT = 0;
+function handleMotion(e){
+  const rr = e.rotationRate;
+  if(!rr || (rr.alpha == null && rr.beta == null && rr.gamma == null)) return;
+
+  const now = performance.now();
+  const dt = lastMotionT ? (now - lastMotionT) / 1000 : 0;
+  lastMotionT = now;
+  if(dt <= 0 || dt > 0.25) return;      // first sample, or the tab was backgrounded
+
+  gyroAvailable = true; gyroOn = true;
+  if(!qDSInit) return;                  // wait for a gravity sample to seed from
+
+  // rotationRate is deg/s about the device's own axes:
+  // beta -> X, gamma -> Y, alpha -> Z.
+  _omega.set(
+    THREE.MathUtils.degToRad(rr.beta  || 0),
+    THREE.MathUtils.degToRad(rr.gamma || 0),
+    THREE.MathUtils.degToRad(rr.alpha || 0)
+  );
+
+  if(invertYaw && gravValid){
+    // Negate only the component of the rotation about the world vertical,
+    // which is the physically correct way to mirror "turning" without
+    // touching pitch or roll.
+    _up.copy(gravDev).multiplyScalar(-1);
+    _omega.addScaledVector(_up, -2 * _up.dot(_omega));
+  }
+
+  const mag = _omega.length();
+  if(mag > 1e-8){
+    _dq.setFromAxisAngle(_omega.divideScalar(mag), mag * dt);
+    qDS.multiply(_dq);                  // right-multiply: increment is in body frame
+  }
+  correctWithGravity(0.02);             // slow pull back to true vertical
+}
+
+function attachSensorListeners(){
+  addEventListener('deviceorientation', handleOrientation, true);
+  addEventListener('deviceorientationabsolute', handleOrientation, true);
+  addEventListener('devicemotion', handleMotion, true);
 }
 
 async function requestMotionPermission(){
-  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-    try {
-      const res = await DeviceOrientationEvent.requestPermission();
-      if (res === 'granted') { attachOrientationListeners(); return true; }
-      motionDenied = true; return false;
-    } catch(_) { motionDenied = true; return false; }
+  const needsOri = typeof DeviceOrientationEvent !== 'undefined' &&
+                   typeof DeviceOrientationEvent.requestPermission === 'function';
+  const needsMot = typeof DeviceMotionEvent !== 'undefined' &&
+                   typeof DeviceMotionEvent.requestPermission === 'function';
+
+  if(!needsOri && !needsMot){          // non-iOS: permission is implicit
+    attachSensorListeners();
+    return true;
   }
-  // Non-iOS (or older iOS without the gate): just attach, permission is implicit.
-  attachOrientationListeners();
+  // Both requests must be *started* inside the user gesture — awaiting the
+  // first before starting the second loses the gesture and iOS rejects it.
+  const pOri = needsOri ? DeviceOrientationEvent.requestPermission() : Promise.resolve('granted');
+  const pMot = needsMot ? DeviceMotionEvent.requestPermission()      : Promise.resolve('granted');
+  let ori = 'denied', mot = 'denied';
+  try { [ori, mot] = await Promise.all([pOri.catch(()=> 'denied'), pMot.catch(()=> 'denied')]); } catch(_){}
+
+  if(ori !== 'granted'){ motionDenied = true; return false; }
+  attachSensorListeners();
   return true;
+}
+
+/* --- compose the final head orientation --------------------------------- */
+function updateHeadOrientation(){
+  if(!gyroOn){
+    head.quaternion.setFromEuler(_euler.set(pitch, yaw, 0, 'YXZ'));
+    return;
+  }
+  if(!legacyTracking && qDSInit){
+    // camera axes == device axes (you look out the back of the phone), so:
+    //   head = (sensor world -> three world) · (device -> sensor world) · (screen rotation)
+    headQ.copy(qSensorToWorld)
+         .multiply(qDS)
+         .multiply(_qa.setFromAxisAngle(_zAxis, -THREE.MathUtils.degToRad(screenAngle)));
+  } else {
+    headQ.copy(legacyQ);
+  }
+  headQ.premultiply(qYawOffset);
+
+  if(invertPitch){
+    _euler.setFromQuaternion(headQ, 'YXZ');
+    _euler.x = -_euler.x;
+    headQ.setFromEuler(_euler);
+  }
+  head.quaternion.copy(headQ);
+}
+
+// Recentre: make wherever you're looking right now the new "forward".
+function recentreView(){
+  _euler.setFromQuaternion(head.quaternion, 'YXZ');
+  qYawOffset.premultiply(_qa.setFromAxisAngle(_yAxis, -_euler.y));
+  yaw = 0;
 }
 
 /* touch-drag look fallback (used when gyro denied, or on desktop) */
@@ -334,10 +478,66 @@ addEventListener('pointermove', e=>{
   drag = {x:e.clientX, y:e.clientY};
 });
 
-/* keyboard (desktop) */
+/* =========================================================================
+   Remote / controller button bindings
+   =========================================================================
+   Rather than guessing what a given Bluetooth remote sends, you press
+   "Learn buttons" and then press your own buttons for forward / back /
+   left / right. Whatever arrives — a keyboard code from a HID-keyboard-mode
+   remote, or a Gamepad button index — gets bound and saved.
+   ========================================================================= */
+const BIND_STEPS = [
+  ['forward', 'FORWARD'],
+  ['back',    'BACK'],
+  ['left',    'LEFT (sidestep)'],
+  ['right',   'RIGHT (sidestep)'],
+];
+let bindings = {};      // { forward:{t:'k',c:'KeyW'} | {t:'p',i:0}, ... }
+let learnIdx = -1;      // -1 = not learning, else index into BIND_STEPS
+
+function bindingLabel(b){
+  if(!b) return 'unset';
+  return b.t === 'k' ? b.c : ('pad button ' + b.i);
+}
+function describeBindings(){
+  if(!Object.keys(bindings).length) return 'Nothing bound yet — gaze, WASD and a standard stick still work.';
+  return BIND_STEPS.map(([k, label]) => `${label}: ${bindingLabel(bindings[k])}`).join('\n');
+}
+function showLearnPrompt(){
+  const el = document.getElementById('bindStatus');
+  if(!el) return;
+  el.textContent = learnIdx < 0
+    ? describeBindings()
+    : `Press your button for ${BIND_STEPS[learnIdx][1]}   (${learnIdx+1} of ${BIND_STEPS.length})`;
+}
+function captureBinding(b){
+  if(learnIdx < 0) return;
+  bindings[BIND_STEPS[learnIdx][0]] = b;
+  learnIdx++;
+  if(learnIdx >= BIND_STEPS.length){
+    learnIdx = -1;
+    saveSettings({ bindings });
+  }
+  showLearnPrompt();
+}
+
+/* =========================================================================
+   Keyboard + remote key capture
+   Bluetooth "VR remotes" that present as a HID keyboard deliver real keydown
+   events here, so they drive movement through exactly the same path as WASD.
+   lastKeyLabel is surfaced in the Tune panel so you can see what (if
+   anything) a given button actually sends.
+   ========================================================================= */
 const keys = {};
-addEventListener('keydown', e=>keys[e.code]=1);
-addEventListener('keyup',   e=>keys[e.code]=0);
+let lastKeyLabel = '—';
+function keyIdOf(e){ return e.code || ('kc' + e.keyCode); }
+addEventListener('keydown', e=>{
+  const id = keyIdOf(e);
+  keys[id] = 1;
+  lastKeyLabel = `${id}  (key "${e.key}", keyCode ${e.keyCode})`;
+  if(learnIdx >= 0){ captureBinding({ t:'k', c:id }); e.preventDefault(); }
+});
+addEventListener('keyup', e=>{ keys[keyIdOf(e)] = 0; });
 
 /* =========================================================================
    Start-screen flow: motion permission must come from a real tap (iOS rule)
@@ -439,7 +639,7 @@ $('floor').onclick = e=>{
   rig.position.y = FLOOR_HEIGHTS[floorIdx] + EYE_HEIGHT;
   e.target.textContent = 'Floor: ' + (floorIdx===0 ? 'G' : floorIdx+'st');
 };
-$('recenter').onclick = ()=>{ alphaOffset += -THREE.MathUtils.degToRad(lastHeadingDeg) - alphaOffset; yaw = 0; };
+$('recenter').onclick = recentreView;
 $('tune').onclick = ()=>{ $('settings').classList.toggle('show'); };
 
 // persist tuning across visits (best-effort; fine if storage is unavailable)
@@ -454,21 +654,34 @@ function saveSettings(patch){
 }
 const savedTune = loadSettings();
 
-const ipdInput = $('ipd'), k1Input = $('k1'), k2Input = $('k2'), spdInput = $('spd'), invInput = $('invPitch');
+const ipdInput = $('ipd'), k1Input = $('k1'), k2Input = $('k2'), spdInput = $('spd');
+const invInput = $('invPitch'), invYawInput = $('invYaw'), legacyInput = $('legacyTrack');
 IPD = savedTune.ipd ?? IPD_DEFAULT; applyIPD();
 distortUniforms.k1.value = savedTune.k1 ?? DISTORT_K1_DEFAULT;
 distortUniforms.k2.value = savedTune.k2 ?? DISTORT_K2_DEFAULT;
 let WALK_SPEED = savedTune.speed ?? WALK_SPEED_DEFAULT;
 invertPitch = !!savedTune.invertPitch;
+invertYaw = !!savedTune.invertYaw;
+legacyTracking = !!savedTune.legacyTracking;
+bindings = savedTune.bindings || {};
 
 ipdInput.value = IPD; k1Input.value = distortUniforms.k1.value; k2Input.value = distortUniforms.k2.value;
 spdInput.value = WALK_SPEED; invInput.checked = invertPitch;
+invYawInput.checked = invertYaw; legacyInput.checked = legacyTracking;
+showLearnPrompt();
 
 ipdInput.oninput = ()=>{ IPD = parseFloat(ipdInput.value); applyIPD(); saveSettings({ipd:IPD}); };
 k1Input.oninput  = ()=>{ distortUniforms.k1.value = parseFloat(k1Input.value); saveSettings({k1:distortUniforms.k1.value}); };
 k2Input.oninput  = ()=>{ distortUniforms.k2.value = parseFloat(k2Input.value); saveSettings({k2:distortUniforms.k2.value}); };
 spdInput.oninput = ()=>{ WALK_SPEED = parseFloat(spdInput.value); saveSettings({speed:WALK_SPEED}); };
 invInput.onchange = ()=>{ invertPitch = invInput.checked; saveSettings({invertPitch}); };
+invYawInput.onchange = ()=>{ invertYaw = invYawInput.checked; saveSettings({invertYaw}); };
+legacyInput.onchange = ()=>{ legacyTracking = legacyInput.checked; saveSettings({legacyTracking}); };
+$('bindBtn').onclick = ()=>{
+  if(learnIdx >= 0){ learnIdx = -1; }        // tap again to cancel
+  else { bindings = {}; learnIdx = 0; }
+  showLearnPrompt();
+};
 
 /* =========================================================================
    Gamepad / Bluetooth VR remote
@@ -597,15 +810,16 @@ function updateMovement(dt){
     else if(Math.abs(pitchDeg) <= GAZE_DEADZONE_DEG) v = 0;
   }
 
-  // desktop keyboard
+  // desktop keyboard (and any remote that presents as a HID keyboard)
   if(keys.KeyW || keys.ArrowUp)   v = 1;
   if(keys.KeyS || keys.ArrowDown) v = -1;
   let strafe = 0;
   if(keys.KeyD || keys.ArrowRight) strafe = 1;
   if(keys.KeyA || keys.ArrowLeft)  strafe = -1;
 
-  // gamepad (Bluetooth VR remote / controller)
   const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+
+  // gamepad (Bluetooth VR remote / controller), default mapping
   for(const p of pads){
     if(!p) continue;
     // analog stick, if the browser reports one
@@ -614,8 +828,7 @@ function updateMovement(dt){
       if(Math.abs(p.axes[0]) > 0.15) strafe = p.axes[0];
     }
     // face buttons as a digital fallback — Standard Gamepad: 0=A/bottom,
-    // 1=B/right, 2=X/left, 3=Y/top. A=forward, B=backward, X=strafe left,
-    // Y=strafe right. D-pad (12-15) also works as forward/back/left/right.
+    // 1=B/right, 2=X/left, 3=Y/top. D-pad is 12-15.
     if(p.buttons[0]?.pressed) v = 1;
     if(p.buttons[1]?.pressed) v = -1;
     if(p.buttons[2]?.pressed) strafe = -1;
@@ -625,6 +838,18 @@ function updateMovement(dt){
     if(p.buttons[14]?.pressed) strafe = -1;
     if(p.buttons[15]?.pressed) strafe = 1;
   }
+
+  // learned bindings win over everything above
+  const active = b => {
+    if(!b) return false;
+    if(b.t === 'k') return !!keys[b.c];
+    for(const p of pads){ if(p && p.buttons[b.i] && p.buttons[b.i].pressed) return true; }
+    return false;
+  };
+  if(active(bindings.forward)) v = 1;
+  if(active(bindings.back))    v = -1;
+  if(active(bindings.left))    strafe = -1;
+  if(active(bindings.right))   strafe = 1;
 
   if(v === 0 && strafe === 0) return;
 
@@ -641,8 +866,7 @@ function updateMovement(dt){
 renderer.setAnimationLoop(()=>{
   const dt = Math.min(clock.getDelta(), 0.05);
 
-  if(gyroOn) head.quaternion.copy(smoothedQ);
-  else head.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
+  updateHeadOrientation();
 
   if(modelLoaded) updateMovement(dt);
 
@@ -671,22 +895,28 @@ renderer.setAnimationLoop(()=>{
   const dbg = document.getElementById('dbg');
   if(dbg.style.display === 'block'){
     const pitchDeg = Math.round(THREE.MathUtils.radToDeg(currentPitchRad()));
-    dbg.textContent = `draw calls: ${renderer.info.render.calls} | tris: ${renderer.info.render.triangles} | fps~${Math.round(1/Math.max(dt,1e-4))} | gyro:${gyroOn?(usingAbsolute?'abs':'rel'):'off'} | pitch:${pitchDeg}° | floor:${floorIdx}`;
+    const track = !gyroOn ? 'touch' : (legacyTracking ? 'legacy' : (gyroAvailable ? 'fusion' : 'gravity-only'));
+    dbg.textContent =
+      `calls:${renderer.info.render.calls} tris:${renderer.info.render.triangles} fps~${Math.round(1/Math.max(dt,1e-4))}\n` +
+      `track:${track}  pitch:${pitchDeg}°  floor:${floorIdx}\n` +
+      `beta:${lastBetaDeg.toFixed(0)} gamma:${lastGammaDeg.toFixed(0)} head:${lastHeadingDeg.toFixed(0)} scr:${screenAngle}`;
   }
 
-  const padTestOn = $('padTest') && $('padTest').checked;
-  if(padTestOn){
+  // live controller / remote diagnostics (only while the Tune panel is open)
+  if($('settings').classList.contains('show')){
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     let lines = [];
     for(const p of pads){
       if(!p) continue;
       const axes = p.axes.map(a=>a.toFixed(2)).join(', ');
-      const btns = p.buttons.map((b,i)=> b.pressed ? i : null).filter(x=>x!==null).join(',');
-      lines.push(`${p.id}\naxes: [${axes}]\npressed buttons: [${btns}]`);
+      const btns = p.buttons.map((b,i)=> b.pressed ? i : null).filter(x=>x!==null);
+      lines.push(`${p.id}\naxes [${axes}]\npressed [${btns.join(',')}]`);
+      if(learnIdx >= 0 && btns.length) captureBinding({ t:'p', i:btns[0] });
     }
-    $('padStatus').textContent = lines.length ? lines.join('\n\n') : 'No controller detected';
-  } else if($('padStatus')){
-    $('padStatus').textContent = padId ? ('Connected: ' + padId) : 'No controller detected';
+    $('padStatus').textContent = lines.length
+      ? lines.join('\n\n')
+      : 'No gamepad detected.\nIf your remote is paired but nothing shows here or\nin "last key", it is sending system media keys that\niOS never passes to a web page — see the README.';
+    $('keyLog').textContent = 'last key: ' + lastKeyLabel;
   }
 });
 </script>

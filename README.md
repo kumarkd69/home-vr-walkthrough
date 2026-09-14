@@ -42,34 +42,109 @@ There's no controller, so movement is driven by where you're looking:
 
 Walking speed is 1.4 m/s by default (tweakable — see below).
 
-**If down feels like backward and up feels like forward for you:** that's a
-real, known issue — cheap phones/headset mounts can report the tilt sensor
-with the opposite sign, which flips the gaze direction. Open **Tune** and
-check **Invert look up/down** — this corrects it without needing to touch
-code. It's saved on your phone, so you only need to set it once.
+## Why head tracking flipped when you looked up (and what changed)
 
-**If you saw sudden flicker/snapping when looking up:** this should now be
-fixed — sensor glitches (mainly near vertical, where the tilt math has a
-mathematical singularity) are filtered out, and the head orientation is
-smoothed frame-to-frame instead of snapping straight to each raw reading.
+This was a real bug with a specific, findable cause — worth writing down
+because almost every three.js cardboard example on the internet has it.
 
-### Using the IRUSU (or similar) Bluetooth VR remote
+`deviceorientation` reports **alpha / beta / gamma**, a Z-X'-Y'' Euler
+decomposition, and gamma is clamped to ±90°. A phone lying in a headset, in
+landscape, looking at the horizon sits at **beta = 0, gamma = −90** — exactly
+on gamma's boundary, which is also the gimbal-lock configuration of that
+decomposition. So the moment you pitch your head above horizontal, iOS has no
+choice but to switch to the other valid encoding of the same pose. Measured
+from the actual math (`tracking-test.mjs`, check 7):
 
-Pair it in **iPhone Settings → Bluetooth** first — the page can't do that
-part for you. Once paired, open **Tune** and check **show raw button/axis
-test**: press the joystick and the A/B/X/Y buttons one at a time and watch
-what shows up next to "Controller". Two outcomes:
+```
+head -5°  ->  alpha   90.0   beta     0.0   gamma  -85.0
+head  0°  ->  alpha   90.0   beta     0.0   gamma  -90.0
+head +5°  ->  alpha  -90.0   beta  -180.0   gamma  +85.0     <-- all three jump
+```
 
-- **You see axis/button numbers change as you press things** — it's a real
-  Gamepad. The joystick already drives movement (forward/back, strafe
-  left/right); the four face buttons are wired as a digital fallback (A =
-  forward, B = backward, X = strafe left, Y = strafe right).
-- **Nothing changes at all, even mid-press** — this remote is very likely
-  emulating a Bluetooth *keyboard*, not a game controller (extremely common
-  for cheap "VR clicker" remotes). In that case its joystick/buttons are
-  probably sending arrow-key or similar keystrokes instead, which the
-  desktop-style **WASD/arrow key** movement already listens for — try
-  pressing the stick in each direction and see if you walk.
+All three values jump ~180° simultaneously, right at the horizon. In exact
+arithmetic those jumps cancel perfectly. In reality they don't: alpha comes
+from the heavily-filtered magnetometer/heading pipeline and lags behind
+beta/gamma. Simulating just **3° of alpha lag gives up to 180° of view error**
+(check 8) — that is your "when I look up it switches to the back angle", and
+it's why you couldn't look up at all: the failure sits right at eye level.
+
+No amount of smoothing or glitch-rejection fixes that, because the data isn't
+glitching — the *representation* is degenerate there. So tracking was rebuilt:
+
+- **Pitch and roll** come from the **gravity direction**, computed from beta
+  and gamma only. Gravity is a physical direction, not a decomposition
+  artifact — and it's provably identical for *both* encodings of a pose
+  (verified to 1e-16 in check 2), so it sails straight through the jump.
+- **Rotation** is carried by **integrating the gyroscope**
+  (`devicemotion.rotationRate`) into a quaternion. Integrating angular
+  velocity never decomposes into Euler angles, so there's no singularity
+  anywhere — you can look straight up, straight down, or roll over.
+- Gravity continuously pulls the integrated orientation back to true vertical,
+  so gyro drift in pitch/roll can't accumulate.
+- **alpha is never read at all.** That also makes tracking immune to indoor
+  magnetic interference, which is a genuine problem inside a house.
+
+Yaw drift is handled by the **Recentre** button, which now simply makes
+wherever you're looking the new "forward".
+
+Verified end-to-end in `tracking-test.mjs`: pitch is recovered to within
+0.000° across a −80°…+85° sweep, look-down correctly reads as negative pitch
+(so **look down = walk forward**), and a full 90° gyro sweep to straight-up
+has no discontinuity (largest single step 0.9°).
+
+Two escape hatches remain in **Tune** in case your phone's axes differ from
+the spec: **Invert look up/down**, **Invert turning**, and **Legacy head
+tracking** (the old method) — all saved on your phone.
+
+> Note: this now requires **motion** permission as well as orientation
+> permission. Earlier versions only asked for orientation, which is why the
+> gyroscope wasn't available. Both are requested on the same tap.
+
+## Using the IRUSU (or similar) Bluetooth VR remote
+
+**Your remote is currently in the wrong mode, and no web page can fix that
+from software.** You reported: A = volume down, X = volume up, Y = mute,
+B = Home (double-press = app switcher), joystick = nothing.
+
+Those are **HID consumer-control codes**. iOS consumes them at the system
+level — they change the ringer volume and open the app switcher no matter
+what app is in front. They are never delivered to Safari, so no JavaScript,
+in this page or any other, can see them. Nothing I write can intercept
+volume, mute, or Home.
+
+These generic VR remotes (IRUSU, VR BOX, Shinecon — all the same reference
+design) ship with **several switchable HID modes**, typically something like
+music/media, mouse/pointer, and game. Yours is in media mode. The mode is
+changed with a **key combination on the remote itself**, usually a modifier
+button (the `@`-looking one, or the power button) **held together with one of
+A/B/X/Y for a few seconds**, sometimes needing a re-pair afterwards.
+
+I don't know the exact combo for your specific unit and won't guess — check
+the slip of paper in the box, or try each modifier + face button held ~3
+seconds, re-pairing in **Settings → Bluetooth** if it drops.
+
+**How to tell instantly whether you've found a mode that works:** open
+**Tune** and watch the *Remote / controller* section while you press buttons.
+
+- **"last key" changes** → the remote is in a keyboard-style mode. This is the
+  best outcome on iOS. Use **Learn buttons** (below).
+- **"pressed [...]" shows button numbers** → it's a real Gamepad. The stick
+  already walks and strafes; face buttons work too. Note that iOS Safari only
+  exposes *some* controllers to the Gamepad API, so this mode may simply not
+  appear even if the remote offers it.
+- **Neither changes, ever** → still in media mode; nothing reaches the page.
+
+### Learn buttons — mapping A/X/Y/B exactly how you wanted
+
+Once *anything* from the remote reaches the page, tap **Learn buttons** in
+Tune. It asks for four presses in order — **FORWARD, BACK, LEFT, RIGHT** — and
+binds whatever arrives for each, whether that's a keyboard code or a gamepad
+button index. So press **A** for forward, **X** for back, **B** for left and
+**Y** for right, exactly as you asked, and that's your mapping. It's saved on
+your phone and survives reloads.
+
+If the remote turns out to have no mode that talks to Safari, gaze-walk is
+still the fully working path — and it should behave properly now.
 
 ## Wall collision
 
@@ -133,7 +208,10 @@ without editing code:
 | `EYE_HEIGHT` | 1.6 m | Fixed eye height above the current floor's slab. |
 | `FLOOR_HEIGHTS` | `[0.0, 3.56]` | Ground and 1st-floor eye-height baselines. **`3.56 m` was auto-detected from the model's floor-tile geometry by `convert.js`** (it clusters the Y-height of every "floor" triangle and reports the top candidates) — re-check this after any re-export. |
 | `PLAYER_RADIUS` | 0.32 m | Collision capsule radius. |
-| Invert look up/down | off | In the Tune panel, not code — flips the gaze pitch axis if your phone/headset reports it backwards. Saved to your phone. |
+| Invert look up/down | off | Tune panel, not code — flips the pitch axis if your phone reports it mirrored. Saved to your phone. |
+| Invert turning | off | Tune panel — same idea for the turn axis. |
+| Legacy head tracking | off | Tune panel — reverts to the old alpha/beta/gamma method described above. Only useful if fusion misbehaves on your device. |
+| Learn buttons | unset | Tune panel — binds your remote's buttons to forward/back/left/right. Saved to your phone. |
 
 ## Model facts, verified from the OBJ
 
@@ -204,10 +282,16 @@ handful of per-room buckets to restore some frustum culling.
 - **Materials are inferred, not authored.** Since the `.mtl` was missing,
   the 6 material buckets are reasonable guesses from `usemtl` names, not a
   designer's actual material assignment — colors/opacity are all synthetic.
-- Tested in a desktop-Chromium environment plus manual code review against
-  documented iOS Safari device-orientation quirks (`webkitCompassHeading`,
-  the permission-gate requirement, `screen.orientation.angle` correction);
-  I was not able to test on a physical iPhone from here, so please treat the
-  first real on-device run as the actual acceptance test, especially around
-  the iOS motion-permission prompt and cardboard lens comfort (IPD/distortion
-  defaults).
+- **Yaw drifts slowly.** Heading now comes purely from gyro integration, and
+  gyros drift — expect "forward" to wander a few degrees over some minutes.
+  That's the deliberate trade for immunity to indoor magnetic interference;
+  tap **Recentre** when it bothers you.
+- **Still not tested on a physical iPhone.** The tracking maths is verified
+  numerically end-to-end (`node tracking-test.mjs`, 8 checks) against
+  synthetic but physically exact device poses, which is much stronger than
+  the previous "reviewed it carefully" — but a simulation of a sensor is not
+  a sensor. The remaining on-device risks are axis-sign conventions (hence
+  the Invert toggles) and lens comfort (IPD/distortion defaults).
+- **The remote may simply not be usable.** If none of its HID modes talk to
+  Safari, that's a hardware/iOS limitation, not something the page can work
+  around. See the remote section above.
