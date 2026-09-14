@@ -5,9 +5,8 @@ stereo side-by-side for a cheap cardboard-style headset (tested against Jio
 VR glasses — no buttons/controller), with head-tracking, gaze-driven
 walking, and wall collision.
 
-Live URL: **https://<your-username>.github.io/<repo-name>/** (filled in
-after first deploy — see bottom of this file / the assistant's final message
-for the actual link and a QR code).
+Live URL: **https://kumarkd69.github.io/home-vr-walkthrough/**
+(scan the QR code sent alongside this file, or open the link directly).
 
 ## Opening it on iPhone
 
