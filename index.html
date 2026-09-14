@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0d0f12">
+<title>Home VR Walkthrough</title>
+<style>
+  :root{ --bg:#0d0f12; --fg:#e9edf2; --accent:#5b8cff; --danger:#e05a5a; }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--fg);
+    font:15px/1.45 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;-webkit-user-select:none;user-select:none;
+    -webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+  canvas{display:block;touch-action:none}
+
+  #start{position:fixed;inset:0;z-index:30;display:flex;flex-direction:column;justify-content:center;
+    align-items:center;gap:14px;padding:28px;text-align:center;background:var(--bg)}
+  #start h1{font-size:21px;margin:0}
+  #start p{margin:0;opacity:.72;font-size:13px;max-width:440px}
+  #loadWrap{width:min(320px,80vw);height:10px;border-radius:6px;background:#20242c;overflow:hidden;display:none}
+  #loadBar{height:100%;width:0%;background:var(--accent);transition:width .15s}
+  #loadPct{font-size:13px;opacity:.75}
+  #startErr{color:var(--danger);font-size:13px;max-width:420px;display:none;white-space:pre-wrap}
+  .bigbtn{display:inline-block;padding:16px 26px;background:var(--accent);border:none;border-radius:12px;
+    font-weight:700;font-size:16px;color:#fff;min-width:220px}
+  .bigbtn.secondary{background:#20242c;color:var(--fg)}
+  #motionRow{display:flex;flex-direction:column;gap:10px;align-items:center}
+
+  #hud{position:fixed;top:max(10px,env(safe-area-inset-top));left:50%;transform:translateX(-50%);z-index:5;
+    font-size:12px;background:rgba(0,0,0,.55);padding:6px 14px;border-radius:20px;opacity:.85;
+    pointer-events:none;text-align:center}
+  #hud.hide{display:none}
+
+  #dbg{position:fixed;top:max(8px,env(safe-area-inset-top));left:8px;z-index:5;font-size:11px;
+    background:rgba(0,0,0,.5);padding:4px 8px;border-radius:8px;opacity:.7;pointer-events:none;display:none}
+
+  #ui{position:fixed;left:0;right:0;bottom:0;padding:10px max(10px,env(safe-area-inset-right)) max(10px,env(safe-area-inset-bottom))
+    max(10px,env(safe-area-inset-left));display:flex;gap:8px;flex-wrap:wrap;
+    background:linear-gradient(transparent,rgba(0,0,0,.8));z-index:6}
+  #ui.hide{display:none}
+  button{flex:1 1 auto;min-width:84px;min-height:48px;padding:12px 8px;border:1px solid #2a2f38;border-radius:10px;
+    background:#171b21cc;color:var(--fg);font-size:13px;font-weight:600}
+  button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+
+  #exit{position:fixed;top:max(8px,env(safe-area-inset-top));right:max(8px,env(safe-area-inset-right));z-index:8;
+    display:none;min-width:auto;padding:10px 16px;background:rgba(20,20,24,.8);border-radius:24px;font-size:13px}
+
+  #settings{position:fixed;right:8px;bottom:70px;z-index:7;width:min(260px,72vw);background:#12151acc;
+    border:1px solid #2a2f38;border-radius:12px;padding:10px 12px;display:none;font-size:12px}
+  #settings.show{display:block}
+  #settings label{display:flex;justify-content:space-between;gap:8px;margin:6px 0}
+  #settings input[type=range]{flex:1}
+  #settings h4{margin:2px 0 6px;font-size:12px;opacity:.7}
+</style>
+</head>
+<body>
+
+<div id="start">
+  <h1>Home VR Walkthrough</h1>
+  <p>Loads <b>home.glb</b> automatically. For head-tracking on iPhone, Safari needs a one-time permission tap below, then use a cardboard-style headset in <b>Enter VR</b>.</p>
+  <div id="motionRow">
+    <button id="enableMotion" class="bigbtn">Enable head tracking</button>
+    <button id="skipMotion" class="bigbtn secondary">Skip — use touch-drag look</button>
+  </div>
+  <div id="loadWrap"><div id="loadBar"></div></div>
+  <p id="loadPct"></p>
+  <p id="startErr"></p>
+</div>
+
+<div id="hud" class="hide">Look <b>down</b> to walk forward · <b>up</b> to walk back</div>
+<div id="dbg"></div>
+<button id="exit">✕ Exit VR</button>
+
+<div id="settings">
+  <h4>Lens / comfort tuning</h4>
+  <label>IPD (m) <input id="ipd" type="range" min="0.05" max="0.075" step="0.001"></label>
+  <label>Distortion k1 <input id="k1" type="range" min="0" max="0.6" step="0.01"></label>
+  <label>Distortion k2 <input id="k2" type="range" min="0" max="0.4" step="0.01"></label>
+  <label>Walk speed (m/s) <input id="spd" type="range" min="0.4" max="3" step="0.1"></label>
+</div>
+
+<div id="ui" class="hide">
+  <button id="vr">🥽 Enter VR</button>
+  <button id="walk" class="on">Gaze-walk</button>
+  <button id="floor">Floor: G</button>
+  <button id="recenter">Recentre</button>
+  <button id="tune">Tune</button>
+</div>
+
+<script type="importmap">
+{"imports":{
+  "three":"https://cdnjs.cloudflare.com/ajax/libs/three.js/0.169.0/three.module.min.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+
+/* =========================================================================
+   TUNABLES — edit these to match your headset / preference.
+   ========================================================================= */
+const GLB_URL       = 'home.glb';
+const EYE_HEIGHT    = 1.6;                 // eye height in metres, fixed per floor
+// Floor slab heights (metres, Y-up, baked by convert.js). Detected from the
+// "floor" tile geometry's Y clusters by convert.js — see its console output.
+// convert.js found clusters at 0.25 / 3.56 / 6.88 m; the first two are used
+// as Ground and Floor 1. Edit this array if your model differs.
+const FLOOR_HEIGHTS = [0.0, 3.56];
+const WALK_SPEED_DEFAULT   = 1.4;          // m/s
+const GAZE_DEADZONE_DEG    = 8;            // no movement inside this pitch band
+const GAZE_FWD_THRESH_DEG  = 18;           // pitch below -this triggers forward (looking down)
+const GAZE_BACK_THRESH_DEG = 22;           // pitch above +this triggers backward (looking up)
+const PLAYER_RADIUS  = 0.32;               // collision capsule radius, metres
+const IPD_DEFAULT     = 0.064;             // metres, cardboard default
+const DISTORT_K1_DEFAULT = 0.22;           // barrel distortion coefficients — tune per headset
+const DISTORT_K2_DEFAULT = 0.08;
+
+/* =========================================================================
+   Renderer / scene
+   ========================================================================= */
+const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));           // cap pixel ratio for perf
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.autoClear = false;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+// simple vertical-gradient sky so an untextured grey model still reads against something
+{
+  const c = document.createElement('canvas'); c.width = 2; c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createLinearGradient(0,0,0,128);
+  g.addColorStop(0,'#7fb1e0'); g.addColorStop(1,'#dce8f2');
+  ctx.fillStyle = g; ctx.fillRect(0,0,2,128);
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  scene.background = tex;
+}
+scene.add(new THREE.HemisphereLight(0xdfe9f5, 0x545a55, 2.4));
+const sun = new THREE.DirectionalLight(0xfff4e0, 1.7);
+sun.position.set(8, 20, 10);
+scene.add(sun);
+scene.add(new THREE.AmbientLight(0xffffff, 0.35)); // cheap fill to fake soft AO readability
+
+/* =========================================================================
+   Rig: rig(position) -> head(orientation) -> camL / camR / camMono
+   ========================================================================= */
+const rig  = new THREE.Object3D(); scene.add(rig);
+const head = new THREE.Object3D(); rig.add(head);
+const camL = new THREE.PerspectiveCamera(70, 1, 0.05, 300);
+const camR = camL.clone();
+const camMono = camL.clone();
+head.add(camL, camR, camMono);
+
+let IPD = IPD_DEFAULT;
+function applyIPD(){ camL.position.x = -IPD/2; camR.position.x = IPD/2; }
+applyIPD();
+
+/* =========================================================================
+   Load home.glb — auto, with progress + error UI
+   ========================================================================= */
+const loadBar = document.getElementById('loadBar');
+const loadWrap = document.getElementById('loadWrap');
+const loadPct = document.getElementById('loadPct');
+const startErr = document.getElementById('startErr');
+const startEl = document.getElementById('start');
+
+let collidables = [];       // meshes used for wall collision (everything except glazing? no — everything except doors)
+let houseBox = new THREE.Box3();
+let modelLoaded = false;
+
+loadWrap.style.display = 'block';
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/libs/draco/');
+const gltfLoader = new GLTFLoader();
+gltfLoader.setDRACOLoader(dracoLoader);
+gltfLoader.load(
+  GLB_URL,
+  gltf => {
+    scene.add(gltf.scene);
+    gltf.scene.traverse(o=>{
+      if(o.isMesh){
+        o.matrixAutoUpdate = false; o.updateMatrix();
+        if(o.name !== 'door') collidables.push(o);   // door leaves excluded so doorways are walkable
+      }
+    });
+    houseBox.setFromObject(gltf.scene);
+    const c = new THREE.Vector3(); houseBox.getCenter(c);
+    rig.position.set(c.x, FLOOR_HEIGHTS[0] + EYE_HEIGHT, c.z);
+    modelLoaded = true;
+    loadPct.textContent = 'Loaded ✓';
+    setTimeout(()=>{ loadWrap.style.display='none'; loadPct.textContent=''; }, 400);
+    readyGate();
+  },
+  xhr => {
+    if(xhr.lengthComputable){
+      const pct = Math.round(xhr.loaded/xhr.total*100);
+      loadBar.style.width = pct + '%';
+      loadPct.textContent = 'Loading model… ' + pct + '%';
+    } else {
+      loadPct.textContent = 'Loading model… ' + Math.round(xhr.loaded/1024/1024*10)/10 + ' MB';
+    }
+  },
+  err => {
+    startErr.style.display = 'block';
+    startErr.textContent = 'Could not load ' + GLB_URL + '.\n' +
+      'Make sure home.glb is in the same folder as this page and that you are loading it over http(s), not file://.\n' +
+      (err && err.message ? err.message : '');
+    loadPct.textContent = '';
+  }
+);
+
+/* =========================================================================
+   iOS / cross-browser device orientation
+   ========================================================================= */
+let gyroOn = false, usingAbsolute = false, motionDenied = false;
+let alphaOffset = 0;               // recentre offset (radians)
+const devQ = new THREE.Quaternion();
+const _euler = new THREE.Euler();
+const _q1 = new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2); // -90deg about X: device "world" -> three.js world
+const _q0 = new THREE.Quaternion();
+const _zee = new THREE.Vector3(0,0,1);
+let screenAngle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+addEventListener('orientationchange', ()=>{
+  screenAngle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+});
+
+let lastHeadingDeg = 0;
+function handleOrientation(e, absolute){
+  let alphaDeg;
+  if (typeof e.webkitCompassHeading === 'number') {
+    // iOS Safari: webkitCompassHeading is degrees clockwise from magnetic north,
+    // and is already an absolute heading — convert to the same convention as `alpha`.
+    alphaDeg = 360 - e.webkitCompassHeading;
+    absolute = true;
+  } else if (e.alpha != null) {
+    alphaDeg = e.alpha;
+  } else return;
+
+  if (usingAbsolute && !absolute) return;   // prefer the absolute source once we have one
+  if (absolute) usingAbsolute = true;
+  gyroOn = true;
+  lastHeadingDeg = alphaDeg;
+
+  const alpha = THREE.MathUtils.degToRad(alphaDeg) + alphaOffset;
+  const beta  = THREE.MathUtils.degToRad(e.beta || 0);
+  const gamma = THREE.MathUtils.degToRad(e.gamma || 0);
+  const orient = THREE.MathUtils.degToRad(screenAngle);
+
+  _euler.set(beta, alpha, -gamma, 'YXZ');
+  devQ.setFromEuler(_euler);
+  devQ.multiply(_q1);
+  devQ.multiply(_q0.setFromAxisAngle(_zee, -orient));
+}
+const onAbs = e => handleOrientation(e, true);
+const onRel = e => handleOrientation(e, false);
+
+function attachOrientationListeners(){
+  addEventListener('deviceorientationabsolute', onAbs, true);
+  addEventListener('deviceorientation', onRel, true);
+}
+
+async function requestMotionPermission(){
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    try {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res === 'granted') { attachOrientationListeners(); return true; }
+      motionDenied = true; return false;
+    } catch(_) { motionDenied = true; return false; }
+  }
+  // Non-iOS (or older iOS without the gate): just attach, permission is implicit.
+  attachOrientationListeners();
+  return true;
+}
+
+/* touch-drag look fallback (used when gyro denied, or on desktop) */
+let drag=null, yaw=0, pitch=0;
+renderer.domElement.addEventListener('pointerdown', e=>{ drag={x:e.clientX,y:e.clientY}; });
+addEventListener('pointerup', ()=>drag=null);
+addEventListener('pointermove', e=>{
+  if(!drag || gyroOn) return;
+  yaw   -= (e.clientX-drag.x)*0.006;
+  pitch -= (e.clientY-drag.y)*0.006;
+  pitch = THREE.MathUtils.clamp(pitch, -1.3, 1.3);
+  drag = {x:e.clientX, y:e.clientY};
+});
+
+/* keyboard (desktop) */
+const keys = {};
+addEventListener('keydown', e=>keys[e.code]=1);
+addEventListener('keyup',   e=>keys[e.code]=0);
+
+/* =========================================================================
+   Start-screen flow: motion permission must come from a real tap (iOS rule)
+   ========================================================================= */
+let motionAsked = false;
+function readyGate(){
+  if(modelLoaded) enterUI();
+}
+function enterUI(){
+  startEl.style.display = 'none';
+  document.getElementById('ui').classList.remove('hide');
+}
+document.getElementById('enableMotion').onclick = async ()=>{
+  motionAsked = true;
+  const ok = await requestMotionPermission();
+  if(!ok){ startErr.style.display='block'; startErr.textContent='Motion access denied — falling back to touch-drag look. You can re-enable it from Settings > Safari > Motion & Orientation Access, then reload.'; }
+  readyGate();
+};
+document.getElementById('skipMotion').onclick = ()=>{ motionAsked = true; readyGate(); };
+
+/* =========================================================================
+   Barrel-distortion stereo pipeline (render each eye to a target, then a
+   fullscreen shader pass pre-distorts it to cancel the cardboard lens's
+   pincushion distortion).
+   ========================================================================= */
+const distortUniforms = {
+  tex:   { value: null },
+  k1:    { value: DISTORT_K1_DEFAULT },
+  k2:    { value: DISTORT_K2_DEFAULT },
+};
+const distortMat = new THREE.ShaderMaterial({
+  uniforms: distortUniforms,
+  vertexShader: `
+    varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader: `
+    precision highp float;
+    uniform sampler2D tex;
+    uniform float k1, k2;
+    varying vec2 vUv;
+    void main(){
+      vec2 c = vUv * 2.0 - 1.0;
+      float r2 = dot(c, c);
+      vec2 cd = c * (1.0 + k1*r2 + k2*r2*r2);
+      vec2 uv = cd * 0.5 + 0.5;
+      if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0){
+        gl_FragColor = vec4(0.0,0.0,0.0,1.0);
+        return;
+      }
+      gl_FragColor = texture2D(tex, uv);
+    }
+  `,
+  depthTest:false, depthWrite:false
+});
+const distortQuad = new THREE.Mesh(new THREE.PlaneGeometry(2,2), distortMat);
+const distortScene = new THREE.Scene(); distortScene.add(distortQuad);
+const distortCam = new THREE.Camera();
+
+let rtL = null, rtR = null;
+function makeRT(w,h){
+  return new THREE.WebGLRenderTarget(w, h, { colorSpace: THREE.SRGBColorSpace, samples: 2 });
+}
+function rebuildRenderTargets(){
+  const w = Math.floor(innerWidth * Math.min(devicePixelRatio,2) / 2);
+  const h = Math.floor(innerHeight * Math.min(devicePixelRatio,2));
+  if(rtL) rtL.dispose(); if(rtR) rtR.dispose();
+  rtL = makeRT(w,h); rtR = makeRT(w,h);
+}
+
+/* =========================================================================
+   UI wiring
+   ========================================================================= */
+let stereo = false, autoWalk = true, floorIdx = 0;
+const $ = id => document.getElementById(id);
+
+async function enterVR(){
+  if(!motionAsked){ await requestMotionPermission(); motionAsked = true; }
+  try{ await document.documentElement.requestFullscreen(); }catch(_){}
+  try{ if(screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape'); }catch(_){}
+  stereo = true;
+  rebuildRenderTargets();
+  $('ui').classList.add('hide'); $('hud').classList.remove('hide'); $('exit').style.display='block';
+  $('settings').classList.remove('show');
+  resize();
+}
+function exitVR(){
+  stereo = false;
+  if(document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+  try{ screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); }catch(_){}
+  $('ui').classList.remove('hide'); $('hud').classList.add('hide'); $('exit').style.display='none';
+  resize();
+}
+$('vr').onclick = enterVR;
+$('exit').onclick = exitVR;
+$('walk').onclick = e=>{ autoWalk = !autoWalk; e.target.classList.toggle('on', autoWalk); };
+$('floor').onclick = e=>{
+  floorIdx = (floorIdx+1) % FLOOR_HEIGHTS.length;
+  rig.position.y = FLOOR_HEIGHTS[floorIdx] + EYE_HEIGHT;
+  e.target.textContent = 'Floor: ' + (floorIdx===0 ? 'G' : floorIdx+'st');
+};
+$('recenter').onclick = ()=>{ alphaOffset += -THREE.MathUtils.degToRad(lastHeadingDeg) - alphaOffset; yaw = 0; };
+$('tune').onclick = ()=>{ $('settings').classList.toggle('show'); };
+
+const ipdInput = $('ipd'), k1Input = $('k1'), k2Input = $('k2'), spdInput = $('spd');
+ipdInput.value = IPD_DEFAULT; k1Input.value = DISTORT_K1_DEFAULT; k2Input.value = DISTORT_K2_DEFAULT; spdInput.value = WALK_SPEED_DEFAULT;
+let WALK_SPEED = WALK_SPEED_DEFAULT;
+ipdInput.oninput = ()=>{ IPD = parseFloat(ipdInput.value); applyIPD(); };
+k1Input.oninput  = ()=>{ distortUniforms.k1.value = parseFloat(k1Input.value); };
+k2Input.oninput  = ()=>{ distortUniforms.k2.value = parseFloat(k2Input.value); };
+spdInput.oninput = ()=>{ WALK_SPEED = parseFloat(spdInput.value); };
+
+/* triple-tap top-left corner toggles the perf HUD (debug aid, hidden by default) */
+let tapCount=0, tapTimer=null;
+addEventListener('pointerdown', e=>{
+  if(e.clientX<60 && e.clientY<60){
+    tapCount++;
+    clearTimeout(tapTimer);
+    tapTimer = setTimeout(()=>tapCount=0, 500);
+    if(tapCount>=3){ $('dbg').style.display = $('dbg').style.display==='block'?'none':'block'; tapCount=0; }
+  }
+});
+
+/* =========================================================================
+   Resize
+   ========================================================================= */
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h);
+  const asp = stereo ? (w/2)/h : w/h;
+  [camL, camR, camMono].forEach(c=>{ c.aspect = asp; c.updateProjectionMatrix(); });
+  if(stereo) rebuildRenderTargets();
+}
+addEventListener('resize', resize);
+resize();
+
+/* =========================================================================
+   Movement + wall collision
+   Collision: for the desired horizontal displacement, raycast from the rig
+   position (at chest height) toward the movement direction, plus two side
+   rays offset by the player radius to catch corner/doorway clipping. If a
+   wall is hit inside (moveDist + radius), the movement is (a) clamped so we
+   never cross the radius buffer, and (b) slid along the wall tangent so
+   grazing a wall doesn't just stop you dead — this is what makes doorway
+   openings feel navigable instead of catching on the frame.
+   ========================================================================= */
+const raycaster = new THREE.Raycaster();
+const _dir = new THREE.Vector3(), _origin = new THREE.Vector3();
+const CHEST_Y_OFFSET = -0.5; // relative to eye height, roughly chest/shoulder level for wall checks
+
+function tryMove(deltaXZ){
+  const dist = deltaXZ.length();
+  if(dist < 1e-6 || collidables.length===0){ rig.position.add(deltaXZ); return; }
+  const dir = deltaXZ.clone().normalize();
+  _origin.copy(rig.position); _origin.y += CHEST_Y_OFFSET;
+
+  // sample the movement direction plus two lateral offsets (approximates a capsule)
+  const lateral = new THREE.Vector3(-dir.z, 0, dir.x).multiplyScalar(PLAYER_RADIUS);
+  const origins = [ _origin.clone(), _origin.clone().add(lateral), _origin.clone().sub(lateral) ];
+
+  let allowed = dist;
+  let hitNormal = null;
+  for(const o of origins){
+    raycaster.set(o, dir);
+    raycaster.far = dist + PLAYER_RADIUS + 0.05;
+    const hits = raycaster.intersectObjects(collidables, false);
+    if(hits.length){
+      const h = hits[0];
+      const free = Math.max(0, h.distance - PLAYER_RADIUS);
+      if(free < allowed){ allowed = free; hitNormal = h.face ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : null; }
+    }
+  }
+
+  if(allowed >= dist - 1e-4){
+    rig.position.add(deltaXZ);
+    return;
+  }
+
+  // move up to the wall
+  rig.position.addScaledVector(dir, allowed);
+
+  // slide: remove the component of the *remaining* desired motion along the wall normal
+  if(hitNormal){
+    const remaining = deltaXZ.clone().sub(dir.clone().multiplyScalar(allowed));
+    hitNormal.y = 0; if(hitNormal.lengthSq() > 1e-6) hitNormal.normalize();
+    const slid = remaining.clone().sub(hitNormal.clone().multiplyScalar(remaining.dot(hitNormal)));
+    // re-check the slid direction so we don't slide straight into another wall/corner
+    if(slid.lengthSq() > 1e-8){
+      const slidDist = slid.length();
+      const slidDir = slid.clone().normalize();
+      raycaster.set(_origin, slidDir);
+      raycaster.far = slidDist + PLAYER_RADIUS + 0.05;
+      const hits2 = raycaster.intersectObjects(collidables, false);
+      const freeSlide = hits2.length ? Math.max(0, hits2[0].distance - PLAYER_RADIUS) : slidDist;
+      rig.position.addScaledVector(slidDir, Math.min(freeSlide, slidDist));
+    }
+  }
+}
+
+const _fwd = new THREE.Vector3(), _flatFwd = new THREE.Vector3(), clock = new THREE.Clock();
+function currentPitchRad(){
+  _fwd.set(0,0,-1).applyQuaternion(head.quaternion);
+  return Math.asin(THREE.MathUtils.clamp(_fwd.y, -1, 1));
+}
+
+function updateMovement(dt){
+  head.getWorldDirection(_flatFwd); _flatFwd.y = 0;
+  if(_flatFwd.lengthSq() < 1e-8) return;
+  _flatFwd.normalize();
+
+  let v = 0;
+
+  if(autoWalk){
+    const pitchDeg = THREE.MathUtils.radToDeg(currentPitchRad());
+    if(pitchDeg < -GAZE_FWD_THRESH_DEG) v = 1;         // looking down past threshold -> walk forward
+    else if(pitchDeg > GAZE_BACK_THRESH_DEG) v = -1;    // looking up past threshold -> walk backward
+    else if(Math.abs(pitchDeg) <= GAZE_DEADZONE_DEG) v = 0;
+  }
+
+  // desktop keyboard
+  if(keys.KeyW || keys.ArrowUp)   v = 1;
+  if(keys.KeyS || keys.ArrowDown) v = -1;
+  let strafe = 0;
+  if(keys.KeyD || keys.ArrowRight) strafe = 1;
+  if(keys.KeyA || keys.ArrowLeft)  strafe = -1;
+
+  // gamepad (Bluetooth VR remote / controller)
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  for(const p of pads){
+    if(!p) continue;
+    if(Math.abs(p.axes[1]) > 0.15) v = -p.axes[1];
+    if(Math.abs(p.axes[0]) > 0.15) strafe = p.axes[0];
+  }
+
+  if(v === 0 && strafe === 0) return;
+
+  const right = new THREE.Vector3(-_flatFwd.z, 0, _flatFwd.x);
+  const delta = new THREE.Vector3()
+    .addScaledVector(_flatFwd, v * WALK_SPEED * dt)
+    .addScaledVector(right, strafe * WALK_SPEED * dt);
+  tryMove(delta);
+}
+
+/* =========================================================================
+   Render loop
+   ========================================================================= */
+renderer.setAnimationLoop(()=>{
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  if(gyroOn) head.quaternion.copy(devQ);
+  else head.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
+
+  if(modelLoaded) updateMovement(dt);
+
+  const w = innerWidth, h = innerHeight;
+
+  if(stereo && rtL && rtR){
+    renderer.setRenderTarget(rtL); renderer.clear(); renderer.render(scene, camL);
+    renderer.setRenderTarget(rtR); renderer.clear(); renderer.render(scene, camR);
+    renderer.setRenderTarget(null);
+    renderer.clear();
+
+    distortUniforms.tex.value = rtL.texture;
+    renderer.setViewport(0, 0, w/2, h);
+    renderer.render(distortScene, distortCam);
+
+    distortUniforms.tex.value = rtR.texture;
+    renderer.setViewport(w/2, 0, w/2, h);
+    renderer.render(distortScene, distortCam);
+  } else {
+    renderer.setRenderTarget(null);
+    renderer.setViewport(0,0,w,h);
+    renderer.clear();
+    renderer.render(scene, camMono);
+  }
+
+  const dbg = document.getElementById('dbg');
+  if(dbg.style.display === 'block'){
+    dbg.textContent = `draw calls: ${renderer.info.render.calls} | tris: ${renderer.info.render.triangles} | fps~${Math.round(1/Math.max(dt,1e-4))} | gyro:${gyroOn?(usingAbsolute?'abs':'rel'):'off'} | floor:${floorIdx}`;
+  }
+});
+</script>
+</body>
+</html>
