@@ -42,6 +42,35 @@ There's no controller, so movement is driven by where you're looking:
 
 Walking speed is 1.4 m/s by default (tweakable — see below).
 
+**If down feels like backward and up feels like forward for you:** that's a
+real, known issue — cheap phones/headset mounts can report the tilt sensor
+with the opposite sign, which flips the gaze direction. Open **Tune** and
+check **Invert look up/down** — this corrects it without needing to touch
+code. It's saved on your phone, so you only need to set it once.
+
+**If you saw sudden flicker/snapping when looking up:** this should now be
+fixed — sensor glitches (mainly near vertical, where the tilt math has a
+mathematical singularity) are filtered out, and the head orientation is
+smoothed frame-to-frame instead of snapping straight to each raw reading.
+
+### Using the IRUSU (or similar) Bluetooth VR remote
+
+Pair it in **iPhone Settings → Bluetooth** first — the page can't do that
+part for you. Once paired, open **Tune** and check **show raw button/axis
+test**: press the joystick and the A/B/X/Y buttons one at a time and watch
+what shows up next to "Controller". Two outcomes:
+
+- **You see axis/button numbers change as you press things** — it's a real
+  Gamepad. The joystick already drives movement (forward/back, strafe
+  left/right); the four face buttons are wired as a digital fallback (A =
+  forward, B = backward, X = strafe left, Y = strafe right).
+- **Nothing changes at all, even mid-press** — this remote is very likely
+  emulating a Bluetooth *keyboard*, not a game controller (extremely common
+  for cheap "VR clicker" remotes). In that case its joystick/buttons are
+  probably sending arrow-key or similar keystrokes instead, which the
+  desktop-style **WASD/arrow key** movement already listens for — try
+  pressing the stick in each direction and see if you walk.
+
 ## Wall collision
 
 Movement is raycast against the merged house geometry (a 3-ray "capsule"
@@ -104,6 +133,7 @@ without editing code:
 | `EYE_HEIGHT` | 1.6 m | Fixed eye height above the current floor's slab. |
 | `FLOOR_HEIGHTS` | `[0.0, 3.56]` | Ground and 1st-floor eye-height baselines. **`3.56 m` was auto-detected from the model's floor-tile geometry by `convert.js`** (it clusters the Y-height of every "floor" triangle and reports the top candidates) — re-check this after any re-export. |
 | `PLAYER_RADIUS` | 0.32 m | Collision capsule radius. |
+| Invert look up/down | off | In the Tune panel, not code — flips the gaze pitch axis if your phone/headset reports it backwards. Saved to your phone. |
 
 ## Model facts, verified from the OBJ
 

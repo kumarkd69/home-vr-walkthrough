@@ -69,7 +69,7 @@
   <p id="startErr"></p>
 </div>
 
-<div id="hud" class="hide">Look <b>down</b> to walk forward · <b>up</b> to walk back</div>
+<div id="hud" class="hide">Look <b>down</b> to walk forward · <b>up</b> to walk back · controller stick also works</div>
 <div id="dbg"></div>
 <button id="exit">✕ Exit VR</button>
 
@@ -79,6 +79,10 @@
   <label>Distortion k1 <input id="k1" type="range" min="0" max="0.6" step="0.01"></label>
   <label>Distortion k2 <input id="k2" type="range" min="0" max="0.4" step="0.01"></label>
   <label>Walk speed (m/s) <input id="spd" type="range" min="0.4" max="3" step="0.1"></label>
+  <label>Invert look up/down <input id="invPitch" type="checkbox"></label>
+  <h4 style="margin-top:10px">Controller</h4>
+  <div id="padStatus" style="opacity:.75;margin-bottom:4px">No controller detected</div>
+  <label style="justify-content:flex-start;gap:6px"><input id="padTest" type="checkbox"> show raw button/axis test</label>
 </div>
 
 <div id="ui" class="hide">
@@ -219,17 +223,29 @@ gltfLoader.load(
    ========================================================================= */
 let gyroOn = false, usingAbsolute = false, motionDenied = false;
 let alphaOffset = 0;               // recentre offset (radians)
-const devQ = new THREE.Quaternion();
+const devQ = new THREE.Quaternion();       // raw (pre-smoothing) device orientation
+const smoothedQ = new THREE.Quaternion();  // low-pass filtered, glitch-rejected — what the head actually uses
+let smoothedQInit = false;
 const _euler = new THREE.Euler();
 const _q1 = new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2); // -90deg about X: device "world" -> three.js world
 const _q0 = new THREE.Quaternion();
 const _zee = new THREE.Vector3(0,0,1);
-let screenAngle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
-addEventListener('orientationchange', ()=>{
-  screenAngle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
-});
 
+// screen.orientation.angle can legitimately be 0 (portrait), so don't use `||`
+// chains that treat 0 as "missing" — that was silently falling back to the
+// (differently-signed) legacy window.orientation and could invert pitch/roll
+// depending on which the browser happened to report first.
+function readScreenAngle(){
+  if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
+  if (typeof window.orientation === 'number') return window.orientation;
+  return 0;
+}
+let screenAngle = readScreenAngle();
+addEventListener('orientationchange', ()=>{ screenAngle = readScreenAngle(); });
+
+let invertPitch = false;
 let lastHeadingDeg = 0;
+
 function handleOrientation(e, absolute){
   let alphaDeg;
   if (typeof e.webkitCompassHeading === 'number') {
@@ -255,6 +271,35 @@ function handleOrientation(e, absolute){
   devQ.setFromEuler(_euler);
   devQ.multiply(_q1);
   devQ.multiply(_q0.setFromAxisAngle(_zee, -orient));
+
+  if (invertPitch) {
+    // Flip only the pitch (device-local X) axis, after the fact, so this is
+    // a guaranteed-correct fix regardless of which raw sensor convention a
+    // given phone/headset combination produces — see the "Invert look
+    // up/down" toggle in Settings.
+    _euler.setFromQuaternion(devQ, 'YXZ');
+    _euler.x = -_euler.x;
+    devQ.setFromEuler(_euler);
+  }
+
+  // --- glitch rejection + smoothing ---------------------------------------
+  // Cheap gyros (and the beta/gamma Euler decomposition itself, which has a
+  // mathematical singularity) occasionally emit one wildly wrong sample —
+  // this is what shows up as a sudden flip/flicker when looking near
+  // straight up or down. Reject a single-frame jump that's implausibly
+  // large, and low-pass filter (slerp) everything else so tracking still
+  // feels responsive but isn't jumpy frame-to-frame.
+  if (!smoothedQInit) {
+    smoothedQ.copy(devQ);
+    smoothedQInit = true;
+  } else {
+    const angleDelta = smoothedQ.angleTo(devQ);
+    if (angleDelta > THREE.MathUtils.degToRad(70)) {
+      // Likely a glitched sample — ignore it, keep last good orientation.
+      return;
+    }
+    smoothedQ.slerp(devQ, 0.35);
+  }
 }
 const onAbs = e => handleOrientation(e, true);
 const onRel = e => handleOrientation(e, false);
@@ -397,13 +442,53 @@ $('floor').onclick = e=>{
 $('recenter').onclick = ()=>{ alphaOffset += -THREE.MathUtils.degToRad(lastHeadingDeg) - alphaOffset; yaw = 0; };
 $('tune').onclick = ()=>{ $('settings').classList.toggle('show'); };
 
-const ipdInput = $('ipd'), k1Input = $('k1'), k2Input = $('k2'), spdInput = $('spd');
-ipdInput.value = IPD_DEFAULT; k1Input.value = DISTORT_K1_DEFAULT; k2Input.value = DISTORT_K2_DEFAULT; spdInput.value = WALK_SPEED_DEFAULT;
-let WALK_SPEED = WALK_SPEED_DEFAULT;
-ipdInput.oninput = ()=>{ IPD = parseFloat(ipdInput.value); applyIPD(); };
-k1Input.oninput  = ()=>{ distortUniforms.k1.value = parseFloat(k1Input.value); };
-k2Input.oninput  = ()=>{ distortUniforms.k2.value = parseFloat(k2Input.value); };
-spdInput.oninput = ()=>{ WALK_SPEED = parseFloat(spdInput.value); };
+// persist tuning across visits (best-effort; fine if storage is unavailable)
+function loadSettings(){
+  try { return JSON.parse(localStorage.getItem('vrTune') || '{}'); } catch(_) { return {}; }
+}
+function saveSettings(patch){
+  try {
+    const cur = loadSettings();
+    localStorage.setItem('vrTune', JSON.stringify(Object.assign(cur, patch)));
+  } catch(_) {}
+}
+const savedTune = loadSettings();
+
+const ipdInput = $('ipd'), k1Input = $('k1'), k2Input = $('k2'), spdInput = $('spd'), invInput = $('invPitch');
+IPD = savedTune.ipd ?? IPD_DEFAULT; applyIPD();
+distortUniforms.k1.value = savedTune.k1 ?? DISTORT_K1_DEFAULT;
+distortUniforms.k2.value = savedTune.k2 ?? DISTORT_K2_DEFAULT;
+let WALK_SPEED = savedTune.speed ?? WALK_SPEED_DEFAULT;
+invertPitch = !!savedTune.invertPitch;
+
+ipdInput.value = IPD; k1Input.value = distortUniforms.k1.value; k2Input.value = distortUniforms.k2.value;
+spdInput.value = WALK_SPEED; invInput.checked = invertPitch;
+
+ipdInput.oninput = ()=>{ IPD = parseFloat(ipdInput.value); applyIPD(); saveSettings({ipd:IPD}); };
+k1Input.oninput  = ()=>{ distortUniforms.k1.value = parseFloat(k1Input.value); saveSettings({k1:distortUniforms.k1.value}); };
+k2Input.oninput  = ()=>{ distortUniforms.k2.value = parseFloat(k2Input.value); saveSettings({k2:distortUniforms.k2.value}); };
+spdInput.oninput = ()=>{ WALK_SPEED = parseFloat(spdInput.value); saveSettings({speed:WALK_SPEED}); };
+invInput.onchange = ()=>{ invertPitch = invInput.checked; saveSettings({invertPitch}); };
+
+/* =========================================================================
+   Gamepad / Bluetooth VR remote
+   Buttons follow the W3C "Standard Gamepad" layout when the browser maps
+   one (button 0/1/2/3 = the four face buttons, e.g. A/B/X/Y or 1/2/3/4).
+   If your remote doesn't show up as a Gamepad at all, it's almost
+   certainly emulating a Bluetooth keyboard instead — try the arrow keys
+   (WASD/arrow movement already works either way); enable "show raw
+   button/axis test" in Settings to see exactly what the browser detects
+   when you press each button.
+   ========================================================================= */
+let padId = null;
+addEventListener('gamepadconnected', e=>{
+  padId = e.gamepad.id;
+  $('padStatus').textContent = 'Connected: ' + padId;
+});
+addEventListener('gamepaddisconnected', ()=>{
+  padId = null;
+  $('padStatus').textContent = 'No controller detected';
+});
 
 /* triple-tap top-left corner toggles the perf HUD (debug aid, hidden by default) */
 let tapCount=0, tapTimer=null;
@@ -523,8 +608,22 @@ function updateMovement(dt){
   const pads = navigator.getGamepads ? navigator.getGamepads() : [];
   for(const p of pads){
     if(!p) continue;
-    if(Math.abs(p.axes[1]) > 0.15) v = -p.axes[1];
-    if(Math.abs(p.axes[0]) > 0.15) strafe = p.axes[0];
+    // analog stick, if the browser reports one
+    if(p.axes.length >= 2){
+      if(Math.abs(p.axes[1]) > 0.15) v = -p.axes[1];
+      if(Math.abs(p.axes[0]) > 0.15) strafe = p.axes[0];
+    }
+    // face buttons as a digital fallback — Standard Gamepad: 0=A/bottom,
+    // 1=B/right, 2=X/left, 3=Y/top. A=forward, B=backward, X=strafe left,
+    // Y=strafe right. D-pad (12-15) also works as forward/back/left/right.
+    if(p.buttons[0]?.pressed) v = 1;
+    if(p.buttons[1]?.pressed) v = -1;
+    if(p.buttons[2]?.pressed) strafe = -1;
+    if(p.buttons[3]?.pressed) strafe = 1;
+    if(p.buttons[12]?.pressed) v = 1;
+    if(p.buttons[13]?.pressed) v = -1;
+    if(p.buttons[14]?.pressed) strafe = -1;
+    if(p.buttons[15]?.pressed) strafe = 1;
   }
 
   if(v === 0 && strafe === 0) return;
@@ -542,7 +641,7 @@ function updateMovement(dt){
 renderer.setAnimationLoop(()=>{
   const dt = Math.min(clock.getDelta(), 0.05);
 
-  if(gyroOn) head.quaternion.copy(devQ);
+  if(gyroOn) head.quaternion.copy(smoothedQ);
   else head.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
 
   if(modelLoaded) updateMovement(dt);
@@ -571,7 +670,23 @@ renderer.setAnimationLoop(()=>{
 
   const dbg = document.getElementById('dbg');
   if(dbg.style.display === 'block'){
-    dbg.textContent = `draw calls: ${renderer.info.render.calls} | tris: ${renderer.info.render.triangles} | fps~${Math.round(1/Math.max(dt,1e-4))} | gyro:${gyroOn?(usingAbsolute?'abs':'rel'):'off'} | floor:${floorIdx}`;
+    const pitchDeg = Math.round(THREE.MathUtils.radToDeg(currentPitchRad()));
+    dbg.textContent = `draw calls: ${renderer.info.render.calls} | tris: ${renderer.info.render.triangles} | fps~${Math.round(1/Math.max(dt,1e-4))} | gyro:${gyroOn?(usingAbsolute?'abs':'rel'):'off'} | pitch:${pitchDeg}° | floor:${floorIdx}`;
+  }
+
+  const padTestOn = $('padTest') && $('padTest').checked;
+  if(padTestOn){
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    let lines = [];
+    for(const p of pads){
+      if(!p) continue;
+      const axes = p.axes.map(a=>a.toFixed(2)).join(', ');
+      const btns = p.buttons.map((b,i)=> b.pressed ? i : null).filter(x=>x!==null).join(',');
+      lines.push(`${p.id}\naxes: [${axes}]\npressed buttons: [${btns}]`);
+    }
+    $('padStatus').textContent = lines.length ? lines.join('\n\n') : 'No controller detected';
+  } else if($('padStatus')){
+    $('padStatus').textContent = padId ? ('Connected: ' + padId) : 'No controller detected';
   }
 });
 </script>
