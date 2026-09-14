@@ -33,6 +33,9 @@
     pointer-events:none;text-align:center}
   #hud.hide{display:none}
 
+  #cal{position:fixed;inset:0;z-index:9;display:none;align-items:center;justify-content:center;
+    text-align:center;background:rgba(0,0,0,.82);font-size:15px;line-height:1.6;padding:24px}
+
   #dbg{position:fixed;top:max(8px,env(safe-area-inset-top));left:8px;z-index:5;
     font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;
     background:rgba(0,0,0,.5);padding:4px 8px;border-radius:8px;opacity:.75;pointer-events:none;display:none}
@@ -73,6 +76,7 @@
   <p id="startErr"></p>
 </div>
 
+<div id="cal"></div>
 <div id="hud" class="hide">Look <b>down</b> to walk forward · <b>up</b> to walk back · controller stick also works</div>
 <div id="dbg"></div>
 <button id="exit">✕ Exit VR</button>
@@ -86,6 +90,7 @@
   <label>Invert look up/down <input id="invPitch" type="checkbox"></label>
   <label>Invert turning <input id="invYaw" type="checkbox"></label>
   <label>Legacy head tracking <input id="legacyTrack" type="checkbox"></label>
+  <label>Show diagnostics <input id="diagToggle" type="checkbox"></label>
 
   <h4 style="margin-top:12px">Remote / controller</h4>
   <div id="padStatus" class="mono">No controller detected</div>
@@ -429,9 +434,60 @@ async function requestMotionPermission(){
   let ori = 'denied', mot = 'denied';
   try { [ori, mot] = await Promise.all([pOri.catch(()=> 'denied'), pMot.catch(()=> 'denied')]); } catch(_){}
 
-  if(ori !== 'granted'){ motionDenied = true; return false; }
+  // Attach either way: if access really was refused no events ever fire, and
+  // if the user grants it later (Settings > Safari > Motion & Orientation)
+  // tracking starts working without needing a reload.
   attachSensorListeners();
+  if(ori !== 'granted'){ motionDenied = true; return false; }
   return true;
+}
+
+/* =========================================================================
+   MOUNT ANGLE — how the phone is rotated inside the headset
+   =========================================================================
+   Everything above gives the phone's orientation in the world. To render it
+   we also need to know which way is "up" for the person wearing it, i.e. how
+   far the phone is rotated about the viewing axis inside the headset.
+
+   The obvious source, screen.orientation.angle, is NOT trustworthy for this:
+   iOS Safari cannot lock orientation from a web page, and if the user has
+   Portrait Orientation Lock switched on (very common) Safari keeps reporting
+   angle = 0 while the phone is physically sideways in the headset. Trusting
+   it then rotates the whole world by 90°, which turns head pitch into view
+   roll — "it tilts weirdly when I turn".
+
+   So measure it physically instead. While you are looking straight ahead the
+   viewing axis is horizontal, so gravity lies in the plane of the screen —
+   and its direction in that plane IS the mount rotation. That is a physical
+   measurement; no OS reporting quirk can spoil it.
+   ========================================================================= */
+let mountAngle = null;   // radians; null until calibrated, then measured
+
+function effectiveMount(){
+  // before calibration, fall back to the OS value
+  return mountAngle !== null ? mountAngle : -THREE.MathUtils.degToRad(screenAngle);
+}
+
+function calibrateMount(){
+  if(!gravValid) return false;
+  const gx = gravDev.x, gy = gravDev.y;
+  // if the phone is lying flat, gravity is along the viewing axis and tells us
+  // nothing about rotation in the screen plane — refuse rather than guess
+  if(Math.hypot(gx, gy) < 0.25) return false;
+  mountAngle = Math.atan2(gx, -gy);
+  return true;
+}
+
+const HALF_PI = Math.PI / 2;
+function wrapPi(a){ return Math.atan2(Math.sin(a), Math.cos(a)); }
+
+// How far the canvas itself is rotated relative to the user's eyes. Zero when
+// Safari rotated the layout to match the phone; ±90° when rotation lock kept
+// the layout portrait while the phone is sideways in the headset.
+function canvasRotation(){
+  if(mountAngle === null) return 0;
+  const r = wrapPi(mountAngle + THREE.MathUtils.degToRad(screenAngle));
+  return Math.round(r / HALF_PI) * HALF_PI;     // snap to a right angle
 }
 
 /* --- compose the final head orientation --------------------------------- */
@@ -442,10 +498,10 @@ function updateHeadOrientation(){
   }
   if(!legacyTracking && qDSInit){
     // camera axes == device axes (you look out the back of the phone), so:
-    //   head = (sensor world -> three world) · (device -> sensor world) · (screen rotation)
+    //   head = (sensor world -> three world) · (device -> sensor world) · (mount)
     headQ.copy(qSensorToWorld)
          .multiply(qDS)
-         .multiply(_qa.setFromAxisAngle(_zAxis, -THREE.MathUtils.degToRad(screenAngle)));
+         .multiply(_qa.setFromAxisAngle(_zAxis, effectiveMount()));
   } else {
     headQ.copy(legacyQ);
   }
@@ -459,11 +515,16 @@ function updateHeadOrientation(){
   head.quaternion.copy(headQ);
 }
 
-// Recentre: make wherever you're looking right now the new "forward".
+// Recentre: make wherever you're looking right now the new "forward", and
+// re-measure how the phone is sitting in the headset.
 function recentreView(){
+  const remeasured = calibrateMount();
+  if(remeasured) applyCanvasRotation();
+  updateHeadOrientation();
   _euler.setFromQuaternion(head.quaternion, 'YXZ');
   qYawOffset.premultiply(_qa.setFromAxisAngle(_yAxis, -_euler.y));
   yaw = 0;
+  return remeasured;
 }
 
 /* touch-drag look fallback (used when gyro denied, or on desktop) */
@@ -543,8 +604,11 @@ addEventListener('keyup', e=>{ keys[keyIdOf(e)] = 0; });
    Start-screen flow: motion permission must come from a real tap (iOS rule)
    ========================================================================= */
 let motionAsked = false;
+// The start screen must NOT dismiss itself just because the model finished
+// loading — iOS only grants motion access from inside a real tap handler, so
+// the user has to actually press one of those two buttons first.
 function readyGate(){
-  if(modelLoaded) enterUI();
+  if(modelLoaded && motionAsked) enterUI();
 }
 function enterUI(){
   startEl.style.display = 'none';
@@ -602,8 +666,8 @@ function makeRT(w,h){
   return new THREE.WebGLRenderTarget(w, h, { colorSpace: THREE.SRGBColorSpace, samples: 2 });
 }
 function rebuildRenderTargets(){
-  const w = Math.floor(innerWidth * Math.min(devicePixelRatio,2) / 2);
-  const h = Math.floor(innerHeight * Math.min(devicePixelRatio,2));
+  const w = Math.floor(viewW * Math.min(devicePixelRatio,2) / 2);
+  const h = Math.floor(viewH * Math.min(devicePixelRatio,2));
   if(rtL) rtL.dispose(); if(rtR) rtR.dispose();
   rtL = makeRT(w,h); rtR = makeRT(w,h);
 }
@@ -612,24 +676,70 @@ function rebuildRenderTargets(){
    UI wiring
    ========================================================================= */
 let stereo = false, autoWalk = true, floorIdx = 0;
+let viewW = innerWidth, viewH = innerHeight;
 const $ = id => document.getElementById(id);
 
 async function enterVR(){
   if(!motionAsked){ await requestMotionPermission(); motionAsked = true; }
   try{ await document.documentElement.requestFullscreen(); }catch(_){}
+  // Note: iOS Safari does not support orientation lock from a web page, so
+  // this silently does nothing there. That is exactly why the mount angle is
+  // measured from gravity instead of trusted from screen.orientation.
   try{ if(screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape'); }catch(_){}
   stereo = true;
+  $('ui').classList.add('hide'); $('settings').classList.remove('show');
+  $('exit').style.display='block';
+  applyCanvasRotation();
   rebuildRenderTargets();
-  $('ui').classList.add('hide'); $('hud').classList.remove('hide'); $('exit').style.display='block';
-  $('settings').classList.remove('show');
-  resize();
+  runCalibration();
+}
+
+/* Calibration countdown: you cannot tap the screen once the phone is inside
+   the headset, so give it a few seconds to be mounted, then measure. */
+let calTimer = null;
+function runCalibration(seconds = 6){
+  const el = $('cal');
+  clearInterval(calTimer);
+  $('hud').classList.add('hide');
+  el.style.display = 'flex';
+  let left = seconds;
+  const tick = ()=>{
+    el.innerHTML = `<div><b>Put the phone in the headset</b><br>` +
+      `Hold your head level, looking straight ahead.<br>` +
+      `<span style="font-size:34px">${left}</span></div>`;
+    if(left <= 0){
+      clearInterval(calTimer);
+      const ok = recentreView();
+      // If the canvas had to be rotated, iOS kept the page portrait while the
+      // phone is sideways — i.e. Portrait Orientation Lock is on. The 3D view
+      // is corrected, but the buttons/text overlays cannot rotate with it.
+      const locked = canvasRotation() !== 0;
+      let msg;
+      if(!ok) msg = 'Could not calibrate — hold the phone upright, then tap Recentre';
+      else if(locked) msg = '✓ Calibrated<br><br><b>Turn off Portrait Orientation Lock</b><br>' +
+        '(swipe down from the top-right, tap the padlock icon)<br>then tap Recentre — ' +
+        'the view is corrected either way, but the on-screen buttons will be sideways until you do.';
+      else msg = '✓ Calibrated';
+      el.innerHTML = `<div>${msg}</div>`;
+      setTimeout(()=>{
+        el.style.display = 'none';
+        if(stereo) $('hud').classList.remove('hide');
+      }, locked ? 5000 : 900);
+    }
+    left--;
+  };
+  tick();
+  calTimer = setInterval(tick, 1000);
 }
 function exitVR(){
   stereo = false;
+  clearInterval(calTimer);
+  $('cal').style.display = 'none';
   if(document.fullscreenElement) document.exitFullscreen().catch(()=>{});
   try{ screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); }catch(_){}
   $('ui').classList.remove('hide'); $('hud').classList.add('hide'); $('exit').style.display='none';
-  resize();
+  mountAngle = null;            // back to a hand-held phone; re-measure next time
+  applyCanvasRotation();
 }
 $('vr').onclick = enterVR;
 $('exit').onclick = exitVR;
@@ -677,6 +787,7 @@ spdInput.oninput = ()=>{ WALK_SPEED = parseFloat(spdInput.value); saveSettings({
 invInput.onchange = ()=>{ invertPitch = invInput.checked; saveSettings({invertPitch}); };
 invYawInput.onchange = ()=>{ invertYaw = invYawInput.checked; saveSettings({invertYaw}); };
 legacyInput.onchange = ()=>{ legacyTracking = legacyInput.checked; saveSettings({legacyTracking}); };
+$('diagToggle').onchange = e=>{ $('dbg').style.display = e.target.checked ? 'block' : 'none'; };
 $('bindBtn').onclick = ()=>{
   if(learnIdx >= 0){ learnIdx = -1; }        // tap again to cancel
   else { bindings = {}; learnIdx = 0; }
@@ -717,15 +828,41 @@ addEventListener('pointerdown', e=>{
 /* =========================================================================
    Resize
    ========================================================================= */
+// The drawing surface is sized in the *viewer's* frame, not the browser's. If
+// iOS rotation lock has kept the layout portrait while the phone is sideways
+// in the headset, we draw a landscape buffer and rotate the canvas element
+// itself with CSS — so all the stereo/viewport logic below stays unchanged.
+function applyCanvasRotation(){
+  const r = canvasRotation();
+  const quarterTurned = Math.abs(Math.round(r / HALF_PI)) % 2 === 1;
+  viewW = quarterTurned ? innerHeight : innerWidth;
+  viewH = quarterTurned ? innerWidth  : innerHeight;
+
+  const el = renderer.domElement;
+  if(r === 0){
+    el.style.cssText = 'display:block;touch-action:none';
+  } else {
+    el.style.cssText = 'display:block;touch-action:none;position:fixed;left:50%;top:50%;' +
+      `width:${viewW}px;height:${viewH}px;` +
+      `transform:translate(-50%,-50%) rotate(${Math.round(-r * 180 / Math.PI)}deg);`;
+  }
+  resize();
+}
+
 function resize(){
-  const w = innerWidth, h = innerHeight;
-  renderer.setSize(w, h);
-  const asp = stereo ? (w/2)/h : w/h;
+  const r = canvasRotation();
+  const quarterTurned = Math.abs(Math.round(r / HALF_PI)) % 2 === 1;
+  viewW = quarterTurned ? innerHeight : innerWidth;
+  viewH = quarterTurned ? innerWidth  : innerHeight;
+
+  renderer.setSize(viewW, viewH, r === 0);   // don't let three.js reset our CSS when rotated
+  const asp = stereo ? (viewW/2)/viewH : viewW/viewH;
   [camL, camR, camMono].forEach(c=>{ c.aspect = asp; c.updateProjectionMatrix(); });
   if(stereo) rebuildRenderTargets();
 }
-addEventListener('resize', resize);
-resize();
+addEventListener('resize', ()=>applyCanvasRotation());
+addEventListener('orientationchange', ()=>setTimeout(()=>applyCanvasRotation(), 150));
+applyCanvasRotation();
 
 /* =========================================================================
    Movement + wall collision
@@ -870,7 +1007,7 @@ renderer.setAnimationLoop(()=>{
 
   if(modelLoaded) updateMovement(dt);
 
-  const w = innerWidth, h = innerHeight;
+  const w = viewW, h = viewH;
 
   if(stereo && rtL && rtR){
     renderer.setRenderTarget(rtL); renderer.clear(); renderer.render(scene, camL);
@@ -894,12 +1031,20 @@ renderer.setAnimationLoop(()=>{
 
   const dbg = document.getElementById('dbg');
   if(dbg.style.display === 'block'){
-    const pitchDeg = Math.round(THREE.MathUtils.radToDeg(currentPitchRad()));
-    const track = !gyroOn ? 'touch' : (legacyTracking ? 'legacy' : (gyroAvailable ? 'fusion' : 'gravity-only'));
+    const R = THREE.MathUtils.radToDeg;
+    const pitchDeg = Math.round(R(currentPitchRad()));
+    const track = !gyroOn ? 'touch' : (legacyTracking ? 'legacy' : (gyroAvailable ? 'fusion' : 'gravity-only(no gyro!)'));
+    _euler.setFromQuaternion(head.quaternion, 'YXZ');
     dbg.textContent =
       `calls:${renderer.info.render.calls} tris:${renderer.info.render.triangles} fps~${Math.round(1/Math.max(dt,1e-4))}\n` +
-      `track:${track}  pitch:${pitchDeg}°  floor:${floorIdx}\n` +
-      `beta:${lastBetaDeg.toFixed(0)} gamma:${lastGammaDeg.toFixed(0)} head:${lastHeadingDeg.toFixed(0)} scr:${screenAngle}`;
+      `track:${track}\n` +
+      `view  pitch:${pitchDeg}° yaw:${R(_euler.y).toFixed(0)}° roll:${R(_euler.z).toFixed(0)}°\n` +
+      `sensor beta:${lastBetaDeg.toFixed(0)} gamma:${lastGammaDeg.toFixed(0)} alpha:${lastHeadingDeg.toFixed(0)}\n` +
+      `grav  ${gravDev.x.toFixed(2)},${gravDev.y.toFixed(2)},${gravDev.z.toFixed(2)}\n` +
+      `mount:${mountAngle===null?'uncal':R(mountAngle).toFixed(0)+'°'} scr:${screenAngle}° ` +
+      `canvasRot:${R(canvasRotation()).toFixed(0)}°\n` +
+      `view ${viewW}x${viewH} win ${innerWidth}x${innerHeight}\n` +
+      `key:${lastKeyLabel.slice(0,34)}`;
   }
 
   // live controller / remote diagnostics (only while the Tune panel is open)

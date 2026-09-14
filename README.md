@@ -18,9 +18,13 @@ Live URL: **https://kumarkd69.github.io/home-vr-walkthrough/**
    something the page can turn on for you.)
 3. Load the page, tap **Enable head tracking** and accept the permission
    prompt (iOS requires this tap-triggered prompt; it can't be requested
-   automatically on page load).
-4. Put the phone in the headset, tap **Enter VR**. The page goes fullscreen,
-   locks to landscape, and switches to the barrel-distorted stereo view.
+   automatically on page load). This grants **both** orientation and motion —
+   the gyroscope needs the second one.
+4. Tap **Enter VR**, then you get a **6-second countdown** — use it to put the
+   phone in the headset and hold your head level, looking straight ahead. It
+   measures how the phone is sitting and calibrates to it. If the view is ever
+   tilted or facing the wrong way, look straight ahead and tap **Recentre** to
+   redo it.
 5. Tap **✕ Exit VR** (top-right) to come back to the flat view.
 
 If you skip motion permission (or deny it), the page falls back to
@@ -42,7 +46,46 @@ There's no controller, so movement is driven by where you're looking:
 
 Walking speed is 1.4 m/s by default (tweakable — see below).
 
-## Why head tracking flipped when you looked up (and what changed)
+## First: turn OFF Portrait Orientation Lock
+
+Swipe down from the top-right of the screen and tap the padlock icon so it's
+off. This matters more than it sounds — see below.
+
+## Why the view tilted/turned weirdly (the second bug)
+
+iOS Safari **cannot lock or control screen orientation from a web page**. If
+you have Portrait Orientation Lock switched on, Safari keeps the page in
+portrait and keeps reporting `screen.orientation.angle === 0` — even while the
+phone is physically sideways in the headset. Any code that trusts that value
+(the previous version did, and so does essentially every cardboard demo)
+rotates the entire world by 90°. Measured:
+
+```
+head turned  -30°  ->  horizon tilt: trusting the OS  90°   measuring gravity  0.00°
+head turned    0°  ->  horizon tilt: trusting the OS  90°   measuring gravity  0.00°
+head turned  +30°  ->  horizon tilt: trusting the OS  90°   measuring gravity  0.00°
+```
+
+A permanent 90° roll is exactly "weirdly turning / tilting" — and because the
+world is rotated a quarter turn, your head *pitch* becomes view *roll*, which
+is also why looking down walked you backwards.
+
+**The fix: stop asking the OS and measure it.** While you look straight ahead
+the viewing axis is horizontal, so gravity lies in the plane of the screen —
+and its direction in that plane *is* the phone's rotation in the headset. That
+is a physical measurement nothing can misreport. Verified for every mounting
+(check 9) and against the rotation-lock scenario (check 10).
+
+Because of this the app now **calibrates**: when you tap Enter VR you get a
+6-second countdown to get the phone into the headset and hold your head level,
+then it measures. **Recentre** re-runs the same measurement any time.
+
+If rotation lock is still on, the 3D view is corrected anyway (the canvas is
+rotated to compensate) and you'll get an on-screen warning — but the buttons
+and text overlays can't rotate with it, so they'll read sideways. Hence: turn
+the lock off.
+
+## Why head tracking flipped when you looked up (the first bug)
 
 This was a real bug with a specific, findable cause — worth writing down
 because almost every three.js cardboard example on the internet has it.
@@ -287,11 +330,17 @@ handful of per-room buckets to restore some frustum culling.
   That's the deliberate trade for immunity to indoor magnetic interference;
   tap **Recentre** when it bothers you.
 - **Still not tested on a physical iPhone.** The tracking maths is verified
-  numerically end-to-end (`node tracking-test.mjs`, 8 checks) against
-  synthetic but physically exact device poses, which is much stronger than
-  the previous "reviewed it carefully" — but a simulation of a sensor is not
-  a sensor. The remaining on-device risks are axis-sign conventions (hence
-  the Invert toggles) and lens comfort (IPD/distortion defaults).
+  numerically end-to-end (`node tracking-test.mjs`, 10 checks) against
+  synthetic but physically exact device poses, and the browser wiring was
+  verified by injecting synthetic sensor events (view roll goes 90° → 0° on
+  calibration, canvas rotates, buffer swaps to landscape) — but a simulation
+  of a sensor is not a sensor. The remaining on-device risks are axis-sign
+  conventions (hence the Invert toggles) and lens comfort.
+- **The UI overlays don't rotate with the canvas** when Portrait Orientation
+  Lock is on. The 3D view is corrected, the buttons aren't. Turning the lock
+  off is the fix; the app tells you so when it detects it.
+- **Yaw is not compass-referenced**, so "forward" is whatever you were facing
+  at calibration, and it drifts slowly. Recentre resets it.
 - **The remote may simply not be usable.** If none of its HID modes talk to
   Safari, that's a hardware/iOS limitation, not something the page can work
   around. See the remote section above.

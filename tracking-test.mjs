@@ -246,5 +246,82 @@ console.log('   alpha lag during a head turn and measure resulting view error:')
   ok(worstFusion < 1e-4, 'fusion should be completely immune to alpha');   // float noise only
 }
 
+// ---------------------------------------------------------------------------
+// The mount angle: measured from gravity instead of trusted from
+// screen.orientation.angle (which iOS rotation lock makes unreliable).
+function calibrateMount(gravDev) {
+  const gx = gravDev.x, gy = gravDev.y;
+  if (Math.hypot(gx, gy) < 0.25) return null;
+  return Math.atan2(gx, -gy);
+}
+function composeHeadWithMount(qDS, mountRad) {
+  return new THREE.Quaternion()
+    .copy(qSensorToWorld)
+    .multiply(qDS)
+    .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), mountRad));
+}
+// How far the rendered "up" is fromtrue world up — i.e. how tilted the horizon
+// looks to the person wearing the headset. Direct and unambiguous, unlike an
+// Euler roll term which degenerates at 90°.
+function horizonTiltDeg(qHead) {
+  const imageUp = new THREE.Vector3(0, 1, 0).applyQuaternion(qHead);
+  return imageUp.angleTo(new THREE.Vector3(0, 1, 0)) * R2D;
+}
+
+console.log('\n9. Mount angle measured from gravity reproduces the true physical');
+console.log('   rotation of the phone in the headset, for every mounting:');
+{
+  for (const phi of [0, 90, -90, 180]) {
+    // phone level, looking north, mounted at rotation phi
+    const t = 0;
+    const f = new THREE.Vector3(0, Math.cos(t), Math.sin(t));
+    const u = new THREE.Vector3(0, -Math.sin(t), Math.cos(t));
+    const r = new THREE.Vector3(1, 0, 0);
+    const qC = new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(r, u, f.clone().negate()));
+    const qD = qC.clone().multiply(
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -phi * D2R));
+    const grav = new THREE.Vector3(0, 0, -1).applyQuaternion(qD.clone().invert());
+    const m = calibrateMount(grav);
+    console.log(`   phone mounted at ${String(phi).padStart(4)}°  ->  measured ${(m * R2D).toFixed(1).padStart(6)}°`);
+    ok(Math.abs(wrap180(m * R2D - phi)) < 0.01, `mount angle wrong for phi=${phi}`);
+  }
+}
+
+console.log('\n10. THE ROTATION-LOCK BUG: phone sideways in the headset, but iOS');
+console.log('    Portrait Orientation Lock keeps reporting screen angle = 0.');
+console.log('    Does the horizon stay level as you turn your head?');
+{
+  const PHI2 = -90;                 // phone physically sideways
+  const LOCKED_SCREEN_ANGLE = 0;    // what iOS reports with rotation lock on
+
+  let worstOld = 0, worstNew = 0;
+  for (let yawDeg = -60; yawDeg <= 60; yawDeg += 10) {
+    // level head, turned by yawDeg
+    const y = yawDeg * D2R;
+    const f = new THREE.Vector3(Math.sin(y), Math.cos(y), 0);
+    const u = new THREE.Vector3(0, 0, 1);
+    const r = new THREE.Vector3().crossVectors(f, u).normalize();   // right-handed: r x u = -f
+    const qC = new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(r, u, f.clone().negate()));
+    const qD = qC.clone().multiply(
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -PHI2 * D2R));
+    const grav = new THREE.Vector3(0, 0, -1).applyQuaternion(qD.clone().invert());
+
+    // OLD: trust screen.orientation.angle  ->  term is Rz(-screenAngle) = Rz(0)
+    const oldTilt = horizonTiltDeg(composeHeadWithMount(qD, -LOCKED_SCREEN_ANGLE * D2R));
+    // NEW: measure the mount from gravity
+    const newTilt = horizonTiltDeg(composeHeadWithMount(qD, calibrateMount(grav)));
+
+    worstOld = Math.max(worstOld, oldTilt);
+    worstNew = Math.max(worstNew, newTilt);
+    if (yawDeg % 30 === 0)
+      console.log(`    head turned ${String(yawDeg).padStart(4)}°  ->  horizon tilt: old ${oldTilt.toFixed(0).padStart(4)}°   new ${newTilt.toFixed(2).padStart(5)}°`);
+  }
+  console.log(`    worst horizon tilt — trusting the OS: ${worstOld.toFixed(0)}°   measuring gravity: ${worstNew.toFixed(2)}°`);
+  ok(worstNew < 0.01, 'measured mount angle still leaves the horizon tilted');
+  ok(worstOld > 80, 'expected the OS-trusting path to be badly tilted');
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);
