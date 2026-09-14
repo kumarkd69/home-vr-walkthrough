@@ -323,5 +323,30 @@ console.log('    Does the horizon stay level as you turn your head?');
   ok(worstOld > 80, 'expected the OS-trusting path to be badly tilted');
 }
 
+console.log('\n11. REGRESSION: the movement direction must be the way you are LOOKING.');
+console.log('    Object3D.getWorldDirection() returns +Z (behind you); only Camera');
+console.log('    overrides it to return the view direction. Using it for movement');
+console.log('    is why looking down walked you AWAY from what you were facing.');
+{
+  const head = new THREE.Object3D();
+  head.quaternion.identity();
+  head.updateWorldMatrix(true, false);
+
+  const viaGetWorldDirection = new THREE.Vector3();
+  head.getWorldDirection(viaGetWorldDirection);
+  const viaMinusZ = new THREE.Vector3(0, 0, -1).applyQuaternion(head.quaternion);
+
+  console.log(`    Object3D.getWorldDirection -> ${viaGetWorldDirection.toArray().map(n=>n.toFixed(0))}`);
+  console.log(`    correct forward (-Z)       -> ${viaMinusZ.toArray().map(n=>n.toFixed(0))}`);
+  ok(viaGetWorldDirection.z > 0.99, 'expected Object3D.getWorldDirection to be +Z');
+  ok(viaMinusZ.z < -0.99, 'expected the corrected forward to be -Z');
+  ok(viaGetWorldDirection.dot(viaMinusZ) < 0, 'the two must be opposite — that was the bug');
+
+  // and the strafe axis derived from forward must be the viewer's right (+X)
+  const right = new THREE.Vector3(-viaMinusZ.z, 0, viaMinusZ.x).normalize();
+  console.log(`    right derived from forward -> ${right.toArray().map(n=>n.toFixed(0))}`);
+  ok(right.x > 0.99, 'strafe right should be +X for a camera facing -Z');
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

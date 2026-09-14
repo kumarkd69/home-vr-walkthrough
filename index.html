@@ -51,6 +51,17 @@
   #exit{position:fixed;top:max(8px,env(safe-area-inset-top));right:max(8px,env(safe-area-inset-right));z-index:8;
     display:none;min-width:auto;padding:10px 16px;background:rgba(20,20,24,.8);border-radius:24px;font-size:13px}
 
+  /* on-screen walk pad for the flat phone view */
+  #pad{position:fixed;left:50%;transform:translateX(-50%);
+    bottom:150px;z-index:6;
+    display:flex;flex-direction:column;align-items:center;gap:8px}
+  #pad.hide{display:none}
+  #pad .padrow{display:flex;gap:8px}
+  .padbtn{width:64px;height:64px;min-width:64px;min-height:64px;padding:0;border-radius:16px;
+    font-size:22px;line-height:1;background:rgba(23,27,33,.82);border:1px solid #39404b;
+    color:var(--fg);flex:0 0 auto;touch-action:none}
+  .padbtn:active,.padbtn.down{background:var(--accent);border-color:var(--accent);color:#fff}
+
   #settings{position:fixed;right:8px;bottom:120px;z-index:7;width:min(260px,72vw);background:#12151af2;
     border:1px solid #2a2f38;border-radius:12px;padding:10px 12px;display:none;font-size:12px;
     max-height:calc(100vh - 190px);overflow-y:auto;-webkit-overflow-scrolling:touch}
@@ -87,6 +98,7 @@
   <label>Distortion k1 <input id="k1" type="range" min="0" max="0.6" step="0.01"></label>
   <label>Distortion k2 <input id="k2" type="range" min="0" max="0.4" step="0.01"></label>
   <label>Walk speed (m/s) <input id="spd" type="range" min="0.4" max="3" step="0.1"></label>
+  <label>Swap gaze walk direction <input id="gazeSwapInput" type="checkbox"></label>
   <label>Invert look up/down <input id="invPitch" type="checkbox"></label>
   <label>Invert turning <input id="invYaw" type="checkbox"></label>
   <label>Legacy head tracking <input id="legacyTrack" type="checkbox"></label>
@@ -97,6 +109,16 @@
   <div id="keyLog" class="mono">last key: —</div>
   <button id="bindBtn" style="width:100%;min-height:40px;margin:6px 0">Learn buttons</button>
   <div id="bindStatus" class="mono"></div>
+</div>
+
+<!-- On-screen walk controls for the plain phone view (no headset needed) -->
+<div id="pad" class="hide">
+  <button class="padbtn" id="padF" data-act="fwd">▲</button>
+  <div class="padrow">
+    <button class="padbtn" id="padL" data-act="left">◀</button>
+    <button class="padbtn" id="padB" data-act="back">▼</button>
+    <button class="padbtn" id="padR" data-act="right">▶</button>
+  </div>
 </div>
 
 <div id="ui" class="hide">
@@ -209,6 +231,7 @@ gltfLoader.load(
     houseBox.setFromObject(gltf.scene);
     const c = new THREE.Vector3(); houseBox.getCenter(c);
     rig.position.set(c.x, FLOOR_HEIGHTS[0] + EYE_HEIGHT, c.z);
+    useCollisionFloor(FLOOR_HEIGHTS[0]);
     modelLoaded = true;
     loadPct.textContent = 'Loaded ✓';
     setTimeout(()=>{ loadWrap.style.display='none'; loadPct.textContent=''; }, 400);
@@ -276,6 +299,7 @@ let motionDenied = false;
 let legacyTracking = false;  // escape hatch: use the old Euler method
 let invertPitch = false;     // escape hatch for a mirrored pitch axis
 let invertYaw = false;       // escape hatch for a mirrored turn axis
+let gazeSwap = false;        // swap which way gaze-walk drives you
 
 // device frame: X = right of screen, Y = top of screen, Z = out of the screen
 // sensor world frame: X = east, Y = north, Z = up
@@ -289,6 +313,7 @@ const headQ = new THREE.Quaternion();        // final composed orientation
 
 const gravDev = new THREE.Vector3(0, 0, -1); // measured "down", in device coords
 let gravValid = false;
+let legacyValid = false;
 
 const _euler = new THREE.Euler();
 const _zAxis = new THREE.Vector3(0, 0, 1);
@@ -340,19 +365,26 @@ function handleOrientation(e){
   if (typeof e.webkitCompassHeading === 'number') lastHeadingDeg = 360 - e.webkitCompassHeading;
   else if (e.alpha != null) lastHeadingDeg = e.alpha;
 
-  // Legacy Euler path, kept only as a user-selectable fallback.
+  // Composition of the raw alpha/beta/gamma. Used as a selectable fallback for
+  // the whole orientation, and — more importantly — as the only available
+  // source of YAW when there is no gyroscope. The individual angles jump
+  // around near the headset's resting pose, but their composition does not.
   if (e.alpha != null || typeof e.webkitCompassHeading === 'number') {
     const a = THREE.MathUtils.degToRad(lastHeadingDeg);
     _euler.set(b, a, -g, 'YXZ');
     legacyQ.setFromEuler(_euler);
     legacyQ.multiply(_qLegacyBack);
-    legacyQ.multiply(_qa.setFromAxisAngle(_zAxis, -THREE.MathUtils.degToRad(screenAngle)));
+    legacyQ.multiply(_qa.setFromAxisAngle(_zAxis, effectiveMount()));
+    legacyValid = true;
   }
 
   if (!qDSInit) { seedFromGravity(); qDSInit = true; }
-  // With no gyro we have to lean on gravity alone for pitch/roll (yaw won't
-  // track in that case — the HUD says so).
-  else if (!gyroAvailable) correctWithGravity(0.35);
+  else if (!gyroAvailable) {
+    // No gyroscope. Gravity alone fully determines pitch and roll, and it is
+    // already smoothed by iOS, so snap straight to it rather than easing —
+    // easing here is what made head movement feel laggy and "not real time".
+    correctWithGravity(1);
+  }
 }
 
 function seedFromGravity(){
@@ -418,27 +450,37 @@ function attachSensorListeners(){
 }
 
 async function requestMotionPermission(){
-  const needsOri = typeof DeviceOrientationEvent !== 'undefined' &&
-                   typeof DeviceOrientationEvent.requestPermission === 'function';
   const needsMot = typeof DeviceMotionEvent !== 'undefined' &&
                    typeof DeviceMotionEvent.requestPermission === 'function';
+  const needsOri = typeof DeviceOrientationEvent !== 'undefined' &&
+                   typeof DeviceOrientationEvent.requestPermission === 'function';
 
   if(!needsOri && !needsMot){          // non-iOS: permission is implicit
     attachSensorListeners();
     return true;
   }
-  // Both requests must be *started* inside the user gesture — awaiting the
-  // first before starting the second loses the gesture and iOS rejects it.
-  const pOri = needsOri ? DeviceOrientationEvent.requestPermission() : Promise.resolve('granted');
-  const pMot = needsMot ? DeviceMotionEvent.requestPermission()      : Promise.resolve('granted');
-  let ori = 'denied', mot = 'denied';
-  try { [ori, mot] = await Promise.all([pOri.catch(()=> 'denied'), pMot.catch(()=> 'denied')]); } catch(_){}
+
+  // Ask for MOTION first and on its own. On iOS both events are governed by the
+  // single "Motion & Orientation Access" setting, so one grant covers both —
+  // but DeviceMotionEvent is the one that gates the *gyroscope*, and the
+  // gyroscope is what yaw (looking left and right) depends on. Firing both
+  // requests at once can get the second one rejected while a prompt is already
+  // up, which silently leaves you with orientation but no gyro: pitch works,
+  // turning your head does nothing, and everything feels laggy.
+  let granted = false;
+  try {
+    if(needsMot) granted = (await DeviceMotionEvent.requestPermission()) === 'granted';
+  } catch(_) { granted = false; }
+
+  if(!granted && needsOri){
+    try { granted = (await DeviceOrientationEvent.requestPermission()) === 'granted'; } catch(_) {}
+  }
 
   // Attach either way: if access really was refused no events ever fire, and
   // if the user grants it later (Settings > Safari > Motion & Orientation)
   // tracking starts working without needing a reload.
   attachSensorListeners();
-  if(ori !== 'granted'){ motionDenied = true; return false; }
+  if(!granted){ motionDenied = true; return false; }
   return true;
 }
 
@@ -502,6 +544,17 @@ function updateHeadOrientation(){
     headQ.copy(qSensorToWorld)
          .multiply(qDS)
          .multiply(_qa.setFromAxisAngle(_zAxis, effectiveMount()));
+
+    // Gravity gives pitch and roll but says nothing about which way you are
+    // facing — rotating about the vertical axis doesn't move gravity at all.
+    // So with no gyroscope yaw would never change and you simply could not
+    // look left or right. Borrow yaw from the alpha/beta/gamma composition.
+    if(!gyroAvailable && legacyValid){
+      _euler.setFromQuaternion(headQ,  'YXZ'); const have = _euler.y;
+      _euler.setFromQuaternion(legacyQ,'YXZ');
+      const want = (invertYaw ? -1 : 1) * _euler.y;
+      headQ.premultiply(_qb.setFromAxisAngle(_yAxis, want - have));
+    }
   } else {
     headQ.copy(legacyQ);
   }
@@ -558,7 +611,9 @@ let learnIdx = -1;      // -1 = not learning, else index into BIND_STEPS
 
 function bindingLabel(b){
   if(!b) return 'unset';
-  return b.t === 'k' ? b.c : ('pad button ' + b.i);
+  if(b.t === 'k') return b.c;
+  if(b.t === 'm') return 'mouse button ' + b.b;
+  return 'pad button ' + b.i;
 }
 function describeBindings(){
   if(!Object.keys(bindings).length) return 'Nothing bound yet — gaze, WASD and a standard stick still work.';
@@ -600,6 +655,19 @@ addEventListener('keydown', e=>{
 });
 addEventListener('keyup', e=>{ keys[keyIdOf(e)] = 0; });
 
+/* Many of these VR remotes have a "mouse" mode, where the stick moves a
+   pointer and the buttons are real mouse clicks. Safari delivers those, so
+   that mode is usable even when the media-key mode is not. Bindable too. */
+const mouseHeld = {};
+addEventListener('pointerdown', e=>{
+  if(e.pointerType !== 'mouse') return;      // don't let a screen tap bind itself
+  mouseHeld[e.button] = 1;
+  lastKeyLabel = `mouse button ${e.button}`;
+  if(learnIdx >= 0){ captureBinding({ t:'m', b:e.button }); e.preventDefault(); }
+});
+addEventListener('pointerup', e=>{ if(e.pointerType === 'mouse') mouseHeld[e.button] = 0; });
+addEventListener('contextmenu', e=>{ if(learnIdx >= 0 || bindings.left || bindings.right) e.preventDefault(); });
+
 /* =========================================================================
    Start-screen flow: motion permission must come from a real tap (iOS rule)
    ========================================================================= */
@@ -613,6 +681,8 @@ function readyGate(){
 function enterUI(){
   startEl.style.display = 'none';
   document.getElementById('ui').classList.remove('hide');
+  document.getElementById('pad').classList.remove('hide');
+  layoutPad();
 }
 document.getElementById('enableMotion').onclick = async ()=>{
   motionAsked = true;
@@ -688,6 +758,7 @@ async function enterVR(){
   try{ if(screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape'); }catch(_){}
   stereo = true;
   $('ui').classList.add('hide'); $('settings').classList.remove('show');
+  $('pad').classList.add('hide');
   $('exit').style.display='block';
   applyCanvasRotation();
   rebuildRenderTargets();
@@ -738,6 +809,7 @@ function exitVR(){
   if(document.fullscreenElement) document.exitFullscreen().catch(()=>{});
   try{ screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); }catch(_){}
   $('ui').classList.remove('hide'); $('hud').classList.add('hide'); $('exit').style.display='none';
+  $('pad').classList.remove('hide');
   mountAngle = null;            // back to a hand-held phone; re-measure next time
   applyCanvasRotation();
 }
@@ -747,6 +819,7 @@ $('walk').onclick = e=>{ autoWalk = !autoWalk; e.target.classList.toggle('on', a
 $('floor').onclick = e=>{
   floorIdx = (floorIdx+1) % FLOOR_HEIGHTS.length;
   rig.position.y = FLOOR_HEIGHTS[floorIdx] + EYE_HEIGHT;
+  useCollisionFloor(FLOOR_HEIGHTS[floorIdx]);
   e.target.textContent = 'Floor: ' + (floorIdx===0 ? 'G' : floorIdx+'st');
 };
 $('recenter').onclick = recentreView;
@@ -773,7 +846,10 @@ let WALK_SPEED = savedTune.speed ?? WALK_SPEED_DEFAULT;
 invertPitch = !!savedTune.invertPitch;
 invertYaw = !!savedTune.invertYaw;
 legacyTracking = !!savedTune.legacyTracking;
+gazeSwap = !!savedTune.gazeSwap;
 bindings = savedTune.bindings || {};
+const gazeSwapInput = $('gazeSwapInput');
+gazeSwapInput.checked = gazeSwap;
 
 ipdInput.value = IPD; k1Input.value = distortUniforms.k1.value; k2Input.value = distortUniforms.k2.value;
 spdInput.value = WALK_SPEED; invInput.checked = invertPitch;
@@ -787,7 +863,22 @@ spdInput.oninput = ()=>{ WALK_SPEED = parseFloat(spdInput.value); saveSettings({
 invInput.onchange = ()=>{ invertPitch = invInput.checked; saveSettings({invertPitch}); };
 invYawInput.onchange = ()=>{ invertYaw = invYawInput.checked; saveSettings({invertYaw}); };
 legacyInput.onchange = ()=>{ legacyTracking = legacyInput.checked; saveSettings({legacyTracking}); };
+gazeSwapInput.onchange = ()=>{ gazeSwap = gazeSwapInput.checked; saveSettings({gazeSwap}); };
 $('diagToggle').onchange = e=>{ $('dbg').style.display = e.target.checked ? 'block' : 'none'; };
+
+/* =========================================================================
+   On-screen walk pad (flat phone view — no headset, no controller needed)
+   ========================================================================= */
+const padHeld = { fwd:0, back:0, left:0, right:0 };
+for(const btn of document.querySelectorAll('.padbtn')){
+  const act = btn.dataset.act;
+  const down = e => { e.preventDefault(); padHeld[act] = 1; btn.classList.add('down'); };
+  const up   = e => { e.preventDefault(); padHeld[act] = 0; btn.classList.remove('down'); };
+  btn.addEventListener('pointerdown', down);
+  btn.addEventListener('pointerup', up);
+  btn.addEventListener('pointercancel', up);
+  btn.addEventListener('pointerleave', up);
+}
 $('bindBtn').onclick = ()=>{
   if(learnIdx >= 0){ learnIdx = -1; }        // tap again to cancel
   else { bindings = {}; learnIdx = 0; }
@@ -849,7 +940,16 @@ function applyCanvasRotation(){
   resize();
 }
 
+// keep the walk pad clear of the button bar, whose height depends on how many
+// rows the buttons wrap onto at this width
+function layoutPad(){
+  const ui = $('ui');
+  const h = ui.classList.contains('hide') ? 0 : ui.getBoundingClientRect().height;
+  $('pad').style.bottom = Math.round(h + 12) + 'px';
+}
+
 function resize(){
+  layoutPad();
   const r = canvasRotation();
   const quarterTurned = Math.abs(Math.round(r / HALF_PI)) % 2 === 1;
   viewW = quarterTurned ? innerHeight : innerWidth;
@@ -878,26 +978,168 @@ const raycaster = new THREE.Raycaster();
 const _dir = new THREE.Vector3(), _origin = new THREE.Vector3();
 const CHEST_Y_OFFSET = -0.5; // relative to eye height, roughly chest/shoulder level for wall checks
 
+/* -------------------------------------------------------------------------
+   Collision geometry.
+   Raycasting the whole house (190k triangles) every frame is what made
+   movement crawl — three.js has no acceleration structure, so each ray tests
+   every triangle. Measured on desktop: 60fps standing still, 30fps the moment
+   you walk; on a phone in stereo it is far worse.
+
+   Since eye height is fixed per floor and we only move horizontally, almost
+   none of that geometry can ever be hit. So build a slim collision mesh per
+   floor, once, keeping only triangles that
+     (a) overlap the band of space the body actually occupies on that floor,
+     (b) are wall-like rather than floor/ceiling-like (a horizontal surface
+         can never block horizontal movement).
+   ------------------------------------------------------------------------- */
+const CELL = 0.5;                  // grid cell size in metres
+const collisionCache = new Map();
+let colTris = null;                // flat Float32Array, 9 floats per triangle
+let colGrid = null;                // Map<cellKey, triangleIndex[]>
+let colStamp = null;               // dedupe scratch
+let colStampTick = 0;
+let colCount = 0;
+
+const cellKey = (ix, iz) => ix * 1000003 + iz;
+
+function buildCollision(floorY){
+  if(collisionCache.has(floorY)) return collisionCache.get(floorY);
+  const lo = floorY + 0.15, hi = floorY + 1.95;
+  const out = [];
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  const ab = new THREE.Vector3(), ac = new THREE.Vector3(), nrm = new THREE.Vector3();
+  let total = 0;
+
+  for(const m of collidables){
+    const p = m.geometry.attributes.position;
+    const idx = m.geometry.index;
+    const count = idx ? idx.count : p.count;
+    for(let i = 0; i < count; i += 3){
+      const i0 = idx ? idx.getX(i)   : i;
+      const i1 = idx ? idx.getX(i+1) : i+1;
+      const i2 = idx ? idx.getX(i+2) : i+2;
+      total++;
+      const y0 = p.getY(i0), y1 = p.getY(i1), y2 = p.getY(i2);
+      if(Math.max(y0,y1,y2) < lo || Math.min(y0,y1,y2) > hi) continue;   // out of reach
+      a.fromBufferAttribute(p, i0); b.fromBufferAttribute(p, i1); c.fromBufferAttribute(p, i2);
+      ab.subVectors(b, a); ac.subVectors(c, a); nrm.crossVectors(ab, ac);
+      const len = nrm.length();
+      if(len < 1e-12) continue;
+      if(Math.abs(nrm.y / len) > 0.75) continue;                         // floor/ceiling-like
+      out.push(a.x,a.y,a.z, b.x,b.y,b.z, c.x,c.y,c.z);
+    }
+  }
+
+  // Bucket every kept triangle into the XZ cells its footprint covers. A step
+  // is ~2cm and the longest ray is ~0.4m, so a query only ever touches a
+  // couple of cells — a few hundred triangles instead of tens of thousands.
+  const tris = new Float32Array(out);
+  const grid = new Map();
+  const n = tris.length / 9;
+  for(let t = 0; t < n; t++){
+    const o = t * 9;
+    const minX = Math.min(tris[o], tris[o+3], tris[o+6]);
+    const maxX = Math.max(tris[o], tris[o+3], tris[o+6]);
+    const minZ = Math.min(tris[o+2], tris[o+5], tris[o+8]);
+    const maxZ = Math.max(tris[o+2], tris[o+5], tris[o+8]);
+    for(let ix = Math.floor(minX/CELL); ix <= Math.floor(maxX/CELL); ix++){
+      for(let iz = Math.floor(minZ/CELL); iz <= Math.floor(maxZ/CELL); iz++){
+        const k = cellKey(ix, iz);
+        let arr = grid.get(k);
+        if(!arr) grid.set(k, arr = []);
+        arr.push(t);
+      }
+    }
+  }
+
+  const result = { tris, grid, count: n, total, stamp: new Uint32Array(n) };
+  collisionCache.set(floorY, result);
+  console.log(`collision floor y=${floorY}: ${n} of ${total} triangles, ${grid.size} grid cells`);
+  return result;
+}
+
+function useCollisionFloor(floorY){
+  const built = buildCollision(floorY);
+  colTris = built.tris; colGrid = built.grid;
+  colStamp = built.stamp; colCount = built.count;
+  return built;
+}
+
+/* Cast a ray against only the triangles near it. Returns distance + normal. */
+const _ray = new THREE.Ray();
+const _va = new THREE.Vector3(), _vb = new THREE.Vector3(), _vc = new THREE.Vector3();
+const _pt = new THREE.Vector3(), _e1 = new THREE.Vector3(), _e2 = new THREE.Vector3();
+const _candidates = [];
+
+function castCollision(origin, dir, maxDist, outNormal){
+  if(!colTris || colCount === 0) return Infinity;
+  _ray.origin.copy(origin); _ray.direction.copy(dir);
+
+  // cells covered by the ray's XZ footprint, padded a little
+  const ex = origin.x + dir.x * maxDist, ez = origin.z + dir.z * maxDist;
+  const pad = 0.05;
+  const ix0 = Math.floor((Math.min(origin.x, ex) - pad) / CELL);
+  const ix1 = Math.floor((Math.max(origin.x, ex) + pad) / CELL);
+  const iz0 = Math.floor((Math.min(origin.z, ez) - pad) / CELL);
+  const iz1 = Math.floor((Math.max(origin.z, ez) + pad) / CELL);
+
+  const tick = ++colStampTick;
+  _candidates.length = 0;
+  for(let ix = ix0; ix <= ix1; ix++){
+    for(let iz = iz0; iz <= iz1; iz++){
+      const arr = colGrid.get(cellKey(ix, iz));
+      if(!arr) continue;
+      for(let i = 0; i < arr.length; i++){
+        const t = arr[i];
+        if(colStamp[t] === tick) continue;     // already considered
+        colStamp[t] = tick;
+        _candidates.push(t);
+      }
+    }
+  }
+
+  let best = Infinity;
+  for(let i = 0; i < _candidates.length; i++){
+    const o = _candidates[i] * 9;
+    _va.set(colTris[o],   colTris[o+1], colTris[o+2]);
+    _vb.set(colTris[o+3], colTris[o+4], colTris[o+5]);
+    _vc.set(colTris[o+6], colTris[o+7], colTris[o+8]);
+    if(_ray.intersectTriangle(_va, _vb, _vc, false, _pt)){
+      const d = origin.distanceTo(_pt);
+      if(d < best && d <= maxDist){
+        best = d;
+        if(outNormal){
+          _e1.subVectors(_vb, _va); _e2.subVectors(_vc, _va);
+          outNormal.crossVectors(_e1, _e2).normalize();
+        }
+      }
+    }
+  }
+  return best;
+}
+
+const _moveDir = new THREE.Vector3(), _lateral = new THREE.Vector3(), _rayOrigin = new THREE.Vector3();
+const _hitN = new THREE.Vector3(), _bestN = new THREE.Vector3();
+const _remaining = new THREE.Vector3(), _slid = new THREE.Vector3(), _slidDir = new THREE.Vector3();
+
 function tryMove(deltaXZ){
   const dist = deltaXZ.length();
-  if(dist < 1e-6 || collidables.length===0){ rig.position.add(deltaXZ); return; }
-  const dir = deltaXZ.clone().normalize();
+  if(dist < 1e-6 || !colTris || colCount === 0){ rig.position.add(deltaXZ); return; }
+  _moveDir.copy(deltaXZ).normalize();
   _origin.copy(rig.position); _origin.y += CHEST_Y_OFFSET;
 
-  // sample the movement direction plus two lateral offsets (approximates a capsule)
-  const lateral = new THREE.Vector3(-dir.z, 0, dir.x).multiplyScalar(PLAYER_RADIUS);
-  const origins = [ _origin.clone(), _origin.clone().add(lateral), _origin.clone().sub(lateral) ];
+  // the movement direction plus two shoulder-width offsets (approximates a capsule)
+  _lateral.set(-_moveDir.z, 0, _moveDir.x).multiplyScalar(PLAYER_RADIUS);
+  const maxDist = dist + PLAYER_RADIUS + 0.05;
 
   let allowed = dist;
-  let hitNormal = null;
-  for(const o of origins){
-    raycaster.set(o, dir);
-    raycaster.far = dist + PLAYER_RADIUS + 0.05;
-    const hits = raycaster.intersectObjects(collidables, false);
-    if(hits.length){
-      const h = hits[0];
-      const free = Math.max(0, h.distance - PLAYER_RADIUS);
-      if(free < allowed){ allowed = free; hitNormal = h.face ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : null; }
+  let haveNormal = false;
+  for(let k = -1; k <= 1; k++){
+    _rayOrigin.copy(_origin).addScaledVector(_lateral, k);
+    const d = castCollision(_rayOrigin, _moveDir, maxDist, _hitN);
+    if(d < Infinity){
+      const free = Math.max(0, d - PLAYER_RADIUS);
+      if(free < allowed){ allowed = free; _bestN.copy(_hitN); haveNormal = true; }
     }
   }
 
@@ -906,23 +1148,22 @@ function tryMove(deltaXZ){
     return;
   }
 
-  // move up to the wall
-  rig.position.addScaledVector(dir, allowed);
+  rig.position.addScaledVector(_moveDir, allowed);   // move up to the wall
 
-  // slide: remove the component of the *remaining* desired motion along the wall normal
-  if(hitNormal){
-    const remaining = deltaXZ.clone().sub(dir.clone().multiplyScalar(allowed));
-    hitNormal.y = 0; if(hitNormal.lengthSq() > 1e-6) hitNormal.normalize();
-    const slid = remaining.clone().sub(hitNormal.clone().multiplyScalar(remaining.dot(hitNormal)));
-    // re-check the slid direction so we don't slide straight into another wall/corner
-    if(slid.lengthSq() > 1e-8){
-      const slidDist = slid.length();
-      const slidDir = slid.clone().normalize();
-      raycaster.set(_origin, slidDir);
-      raycaster.far = slidDist + PLAYER_RADIUS + 0.05;
-      const hits2 = raycaster.intersectObjects(collidables, false);
-      const freeSlide = hits2.length ? Math.max(0, hits2[0].distance - PLAYER_RADIUS) : slidDist;
-      rig.position.addScaledVector(slidDir, Math.min(freeSlide, slidDist));
+  // slide: drop the component of the remaining motion that points into the wall
+  if(haveNormal){
+    _remaining.copy(deltaXZ).addScaledVector(_moveDir, -allowed);
+    _bestN.y = 0;
+    if(_bestN.lengthSq() > 1e-6){
+      _bestN.normalize();
+      _slid.copy(_remaining).addScaledVector(_bestN, -_remaining.dot(_bestN));
+      if(_slid.lengthSq() > 1e-8){
+        const slidDist = _slid.length();
+        _slidDir.copy(_slid).normalize();
+        const d2 = castCollision(_origin, _slidDir, slidDist + PLAYER_RADIUS + 0.05, null);
+        const freeSlide = d2 < Infinity ? Math.max(0, d2 - PLAYER_RADIUS) : slidDist;
+        rig.position.addScaledVector(_slidDir, Math.min(freeSlide, slidDist));
+      }
     }
   }
 }
@@ -934,14 +1175,21 @@ function currentPitchRad(){
 }
 
 function updateMovement(dt){
-  head.getWorldDirection(_flatFwd); _flatFwd.y = 0;
+  // NB: head is a plain Object3D, and Object3D.getWorldDirection() returns the
+  // object's +Z axis — which points BEHIND the viewer. (Only Camera overrides
+  // it to return the viewing direction.) Using it here sent you backwards
+  // whenever you looked down, and mirrored strafing. Take -Z explicitly, which
+  // is also exactly what currentPitchRad() uses, so the two always agree.
+  _flatFwd.set(0, 0, -1).applyQuaternion(head.quaternion);
+  _flatFwd.y = 0;
   if(_flatFwd.lengthSq() < 1e-8) return;
   _flatFwd.normalize();
 
   let v = 0;
 
   if(autoWalk){
-    const pitchDeg = THREE.MathUtils.radToDeg(currentPitchRad());
+    // Looking down walks you TOWARDS whatever you were just looking at.
+    const pitchDeg = THREE.MathUtils.radToDeg(currentPitchRad()) * (gazeSwap ? -1 : 1);
     if(pitchDeg < -GAZE_FWD_THRESH_DEG) v = 1;         // looking down past threshold -> walk forward
     else if(pitchDeg > GAZE_BACK_THRESH_DEG) v = -1;    // looking up past threshold -> walk backward
     else if(Math.abs(pitchDeg) <= GAZE_DEADZONE_DEG) v = 0;
@@ -953,6 +1201,12 @@ function updateMovement(dt){
   let strafe = 0;
   if(keys.KeyD || keys.ArrowRight) strafe = 1;
   if(keys.KeyA || keys.ArrowLeft)  strafe = -1;
+
+  // on-screen walk pad
+  if(padHeld.fwd)   v = 1;
+  if(padHeld.back)  v = -1;
+  if(padHeld.left)  strafe = -1;
+  if(padHeld.right) strafe = 1;
 
   const pads = navigator.getGamepads ? navigator.getGamepads() : [];
 
@@ -980,6 +1234,7 @@ function updateMovement(dt){
   const active = b => {
     if(!b) return false;
     if(b.t === 'k') return !!keys[b.c];
+    if(b.t === 'm') return !!mouseHeld[b.b];
     for(const p of pads){ if(p && p.buttons[b.i] && p.buttons[b.i].pressed) return true; }
     return false;
   };
@@ -1044,6 +1299,8 @@ renderer.setAnimationLoop(()=>{
       `mount:${mountAngle===null?'uncal':R(mountAngle).toFixed(0)+'°'} scr:${screenAngle}° ` +
       `canvasRot:${R(canvasRotation()).toFixed(0)}°\n` +
       `view ${viewW}x${viewH} win ${innerWidth}x${innerHeight}\n` +
+      `pos ${rig.position.x.toFixed(2)},${rig.position.y.toFixed(2)},${rig.position.z.toFixed(2)} ` +
+      `col:${colCount}\n` +
       `key:${lastKeyLabel.slice(0,34)}`;
   }
 

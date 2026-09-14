@@ -46,6 +46,65 @@ There's no controller, so movement is driven by where you're looking:
 
 Walking speed is 1.4 m/s by default (tweakable — see below).
 
+## Using it without a headset (e.g. for parents)
+
+Just open the link on a phone and use the **on-screen arrow buttons**
+(▲ forward, ▼ back, ◀ ▶ sidestep). Drag a finger on the picture to look
+around. No headset, no permissions, no controller needed — tap
+**Skip — use touch-drag look** on the first screen and go.
+
+## Why looking down walked you AWAY from things
+
+This one was a plain bug in my code, present since the first version.
+
+`head` is a `THREE.Object3D`, and **`Object3D.getWorldDirection()` returns the
+object's +Z axis — which points *behind* the viewer.** Only `Camera` overrides
+it to return the direction you're looking. The movement code used it, so the
+walk vector pointed backwards, while `currentPitchRad()` (which decides
+forward vs back) correctly used −Z. The two disagreed by 180°.
+
+So: look at the sofa → look down → walk directly away from the sofa. It
+mirrored sidestepping too. Fixed, and check 11 in `tracking-test.mjs` now
+asserts the two agree so it can't come back.
+
+If it's ever still backwards for you, **Tune → Swap gaze walk direction**
+flips it in one tap.
+
+## Why it was slow / not real time
+
+Two separate causes, both measured:
+
+1. **Collision was raycasting the entire house every frame.** three.js has no
+   acceleration structure, so each ray tested all ~190k triangles. Measured on
+   a fast desktop: **60fps standing still, 30fps the moment you moved** — on a
+   phone rendering in stereo, far worse. Fixed by building a slim per-floor
+   collision set (only wall-like triangles within the band your body actually
+   occupies) and bucketing it into a 0.5m grid, so a step tests a few hundred
+   triangles instead of 190,000. Back to a solid **60fps while moving**, with
+   collision behaviour verified identical (blocked at the same wall, same free
+   travel elsewhere).
+2. **Head tracking was easing toward gravity instead of following it.** With
+   no gyroscope the orientation was being nudged 35% per reading, which reads
+   as lag. iOS already smooths these values, so it now snaps straight to them.
+
+## Why you couldn't look left and right
+
+Yaw came *only* from the gyroscope, and the gyroscope was never arriving — so
+turning your head did nothing at all, and the view only responded to tilt.
+Two fixes:
+
+- **The permission request was wrong.** `DeviceMotionEvent.requestPermission()`
+  (the one that gates the *gyroscope*) was being fired at the same moment as
+  the orientation request. Firing a second request while a prompt is already
+  up gets it rejected, leaving orientation working and the gyro silently dead.
+  Motion is now requested first, on its own.
+- **There's now a fallback.** If the gyroscope still isn't available, yaw is
+  taken from the compass/alpha composition instead, so looking left and right
+  works regardless. Verified: yaw tracks 1:1 with heading, horizon stays level.
+
+The diagnostics panel shows which mode you're in — `track:fusion` (gyro),
+`track:gravity-only(no gyro!)`, or `track:legacy`.
+
 ## First: turn OFF Portrait Orientation Lock
 
 Swipe down from the top-right of the screen and tap the padlock icon so it's
@@ -175,6 +234,10 @@ seconds, re-pairing in **Settings → Bluetooth** if it drops.
   already walks and strafes; face buttons work too. Note that iOS Safari only
   exposes *some* controllers to the Gamepad API, so this mode may simply not
   appear even if the remote offers it.
+- **"last key" shows `mouse button N`** → the remote is in **mouse mode**, and
+  that works too — those buttons are bindable with **Learn buttons**. Of the
+  modes these remotes offer, mouse mode is often the easiest to get working in
+  Safari, so it's worth hunting for.
 - **Neither changes, ever** → still in media mode; nothing reaches the page.
 
 ### Learn buttons — mapping A/X/Y/B exactly how you wanted
