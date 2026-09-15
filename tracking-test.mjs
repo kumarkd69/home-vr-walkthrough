@@ -411,5 +411,57 @@ console.log('    they do not. Raw heading vs the de-glitched heading:');
   ok(worstErr < 0.01, 'real head turning must pass through untouched');
 }
 
+console.log('\n13. THE LOOK-UP FLICKER, PART 2: pulling heading out of a YXZ Euler');
+console.log('    decomposition is singular at pitch ±90 — yaw and roll collapse');
+console.log('    into one degree of freedom, so sensor noise is amplified without');
+console.log('    limit as you look up. Heading from direction vectors is not.');
+{
+  const X = new THREE.Vector3(1,0,0), Y = new THREE.Vector3(0,1,0), Z = new THREE.Vector3(0,0,1);
+  const eulerYaw = q => new THREE.Euler().setFromQuaternion(q, 'YXZ').y * R2D;
+
+  // the same function as index.html
+  function headingOf(q){
+    const f = new THREE.Vector3(0,0,-1).applyQuaternion(q);
+    let x = f.x, z = f.z;
+    if(Math.abs(f.y) > 0.9){
+      const u = new THREE.Vector3(0,1,0).applyQuaternion(q);
+      const s = f.y > 0 ? -1 : 1;
+      x = s*u.x; z = s*u.z;
+    }
+    return Math.atan2(-x, -z) * R2D;
+  }
+
+  const spread = a => Math.max(...a) - Math.min(...a);
+  let worstEuler = 0, worstVec = 0;
+  for(const pitch of [0, 30, 60, 80, 88, 89.8]){
+    const base = new THREE.Quaternion().setFromAxisAngle(X, pitch * D2R);
+    const es = [], vs = [];
+    for(const axis of [X, Y, Z]){
+      for(const n of [-0.5, 0.5]){           // 0.5 deg of sensor noise
+        const q = base.clone().premultiply(new THREE.Quaternion().setFromAxisAngle(axis, n*D2R));
+        es.push(eulerYaw(q)); vs.push(headingOf(q));
+      }
+    }
+    worstEuler = Math.max(worstEuler, spread(es));
+    worstVec   = Math.max(worstVec, spread(vs));
+    console.log(`    pitch ${String(pitch).padStart(5)}°   Euler spread ${spread(es).toFixed(1).padStart(6)}°   vector spread ${spread(vs).toFixed(1).padStart(5)}°`);
+  }
+  console.log(`    worst — Euler: ${worstEuler.toFixed(1)}°   vector: ${worstVec.toFixed(1)}°`);
+  ok(worstEuler > 100, 'expected the Euler extraction to blow up near vertical');
+  ok(worstVec < 2, 'vector heading must stay stable at every pitch');
+
+  // and it must still agree with Euler where Euler is well conditioned
+  let worstDisagree = 0;
+  for(let p = -60; p <= 60; p += 10){
+    for(let h = -170; h <= 170; h += 20){
+      const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(p*D2R, h*D2R, 0, 'YXZ'));
+      const d = Math.abs(((headingOf(q) - h + 540) % 360) - 180);
+      worstDisagree = Math.max(worstDisagree, d);
+    }
+  }
+  console.log(`    agrees with Euler where Euler is valid, to within ${worstDisagree.toFixed(3)}°`);
+  ok(worstDisagree < 0.01, 'vector heading must match Euler in the well-conditioned range');
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

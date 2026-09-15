@@ -578,12 +578,44 @@ function settleCanvasRotation(){
    representation artefact — and hold the last good heading until the values
    settle, rather than following it round.
    ------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------
+   Which way a head is facing, measured from direction vectors rather than an
+   Euler decomposition.
+
+   Pulling heading out of a YXZ Euler decomposition is singular at pitch = ±90:
+   yaw and roll collapse into the same degree of freedom, so as you look
+   steeply up the extracted heading amplifies noise without limit. Measured,
+   with 0.5 degrees of sensor noise:
+
+       pitch      Euler heading spread     this function
+        60 deg            1.7 deg             1.7 deg
+        80 deg            5.7 deg             1.0 deg
+        88 deg           28.1 deg             1.0 deg
+       89.8 deg         248.2 deg             1.0 deg
+
+   That is the flicker when looking up — and at 28 degrees it slips under the
+   per-frame sanity guard, so it shows through as jitter. Fix: use the forward
+   vector while it has a usable horizontal component, and switch to the head's
+   up vector once forward goes near-vertical, where up is horizontal and well
+   conditioned. Stable at every pitch, including straight up.
+   ------------------------------------------------------------------------- */
+const _fv = new THREE.Vector3(), _uv = new THREE.Vector3();
+function headingOf(q){
+  _fv.set(0, 0, -1).applyQuaternion(q);
+  let x = _fv.x, z = _fv.z;
+  if(Math.abs(_fv.y) > 0.9){                 // looking near-straight up or down
+    _uv.set(0, 1, 0).applyQuaternion(q);
+    const s = _fv.y > 0 ? -1 : 1;
+    x = s * _uv.x; z = s * _uv.z;
+  }
+  return Math.atan2(-x, -z);                 // 0 = facing -Z
+}
+
 const MAX_YAW_STEP = THREE.MathUtils.degToRad(60);
 let yawPrevRaw = null, yawFix = 0;
 
 function stableLegacyYaw(){
-  _euler.setFromQuaternion(legacyQ, 'YXZ');
-  const want = (invertYaw ? -1 : 1) * _euler.y;
+  const want = (invertYaw ? -1 : 1) * headingOf(legacyQ);
   if(yawPrevRaw === null){ yawPrevRaw = want; return wrapPi(want + yawFix); }
 
   const delta = wrapPi(want - yawPrevRaw);
@@ -626,8 +658,7 @@ function updateHeadOrientation(dt){
     // look left or right. Borrow yaw from the alpha/beta/gamma composition,
     // de-glitched as above.
     if(!gyroAvailable && legacyValid){
-      _euler.setFromQuaternion(headQ, 'YXZ');
-      const have = _euler.y;
+      const have = headingOf(headQ);
       const want = stableLegacyYaw();
       headQ.premultiply(_qb.setFromAxisAngle(_yAxis, wrapPi(want - have)));
     }
@@ -680,8 +711,7 @@ function recentreView(){
   }
   headInit = false;                     // a recentre is deliberate: let it snap
   updateHeadOrientation();
-  _euler.setFromQuaternion(head.quaternion, 'YXZ');
-  qYawOffset.premultiply(_qa.setFromAxisAngle(_yAxis, -_euler.y));
+  qYawOffset.premultiply(_qa.setFromAxisAngle(_yAxis, -headingOf(head.quaternion)));
   yaw = 0;
   return remeasured;
 }
@@ -1397,10 +1427,11 @@ renderer.setAnimationLoop(()=>{
     const pitchDeg = Math.round(R(currentPitchRad()));
     const track = !gyroOn ? 'touch' : (legacyTracking ? 'legacy' : (gyroAvailable ? 'fusion' : 'gravity-only(no gyro!)'));
     _euler.setFromQuaternion(head.quaternion, 'YXZ');
+    const headingDeg = R(headingOf(head.quaternion));
     dbg.textContent =
       `calls:${renderer.info.render.calls} tris:${renderer.info.render.triangles} fps~${Math.round(1/Math.max(dt,1e-4))}\n` +
       `track:${track}\n` +
-      `view  pitch:${pitchDeg}° yaw:${R(_euler.y).toFixed(0)}° roll:${R(_euler.z).toFixed(0)}°\n` +
+      `view  pitch:${pitchDeg}° yaw:${headingDeg.toFixed(0)}° roll:${R(_euler.z).toFixed(0)}°\n` +
       `sensor beta:${lastBetaDeg.toFixed(0)} gamma:${lastGammaDeg.toFixed(0)} alpha:${lastHeadingDeg.toFixed(0)}\n` +
       `grav  ${gravDev.x.toFixed(2)},${gravDev.y.toFixed(2)},${gravDev.z.toFixed(2)}\n` +
       `mount:${mountAngle===null?'uncal':R(mountAngle).toFixed(0)+'°'} scr:${screenAngle}° ` +

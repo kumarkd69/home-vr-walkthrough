@@ -86,10 +86,32 @@ almost always a spurious re-evaluation. It now has to hold steady for 600ms
 before it's believed: transient flaps are ignored entirely, a genuine
 sustained change is still adopted. Verified both ways.
 
+**And one more, specific to looking up.** Heading was being pulled out of a
+YXZ Euler decomposition, which is singular at pitch ±90°: yaw and roll
+collapse into the same degree of freedom, so sensor noise gets amplified
+without limit as you tilt further up. Measured, with 0.5° of noise:
+
+```
+pitch     Euler heading spread     vector heading spread
+   60°             1.7°                    1.7°
+   80°             5.7°                    1.0°
+   88°            28.1°                    1.0°
+ 89.8°           248.2°                    1.0°
+```
+
+At 28° it also slips under the per-frame guard below, so it came through as
+visible jitter rather than being caught. Heading is now measured from
+direction vectors instead — the forward vector while it has a usable
+horizontal component, switching to the head's up vector once forward goes
+near-vertical (where up is horizontal and well conditioned). Stable at every
+pitch, and identical to the old method wherever the old method was valid
+(agrees to 0.000°). Verified in the browser: heading spread stays 0° all the
+way to 85° of look-up, with noise on every sample.
+
 Finally there's a catch-all: the head cannot rotate more than 70° between two
 frames (that would be >4000°/s), so any frame claiming otherwise is dropped —
 whatever the cause. It gives up after ~330ms so a real change can never leave
-the view frozen. Normal head turning triggers it zero times.
+the view frozen. Normal continuous head movement triggers it zero times.
 
 Separately, every orientation change now eases in over ~24ms instead of being
 applied in one step, so nothing in the view moves a whole frame at a time.
