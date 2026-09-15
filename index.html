@@ -522,13 +522,40 @@ function calibrateMount(){
 const HALF_PI = Math.PI / 2;
 function wrapPi(a){ return Math.atan2(Math.sin(a), Math.cos(a)); }
 
-// How far the canvas itself is rotated relative to the user's eyes. Zero when
-// Safari rotated the layout to match the phone; ±90° when rotation lock kept
-// the layout portrait while the phone is sideways in the headset.
-function canvasRotation(){
+/* -------------------------------------------------------------------------
+   How far the canvas itself must be rotated to match the user's eyes. Zero
+   when Safari rotated the layout to match the phone; ±90° when rotation lock
+   kept the layout portrait while the phone lies sideways in the headset.
+
+   This must NOT be recomputed live. Tilting a phone towards flat — exactly
+   what looking down or up in a headset does — makes iOS re-evaluate device
+   orientation and fire `orientationchange`, so screen.orientation.angle flips
+   by 90 or 180 degrees mid-session. Following that instantly snaps the whole
+   view round, which is the abrupt flip to a "back view" when you look down or
+   turn your head. The phone cannot actually move inside the headset, so a
+   change here is almost always a spurious re-evaluation: require it to hold
+   steady before believing it.
+   ------------------------------------------------------------------------- */
+let appliedCanvasRot = 0;
+let pendingRot = null, pendingRotSince = 0;
+const ROT_SETTLE_MS = 600;
+
+function desiredCanvasRotation(){
   if(mountAngle === null) return 0;
-  const r = wrapPi(mountAngle + THREE.MathUtils.degToRad(screenAngle));
+  const r = wrapPi(mountAngle + THREE.MathUtils.degToRad(readScreenAngle()));
   return Math.round(r / HALF_PI) * HALF_PI;     // snap to a right angle
+}
+
+// Called every frame: adopt a new rotation only once it has been stable.
+function settleCanvasRotation(){
+  const want = desiredCanvasRotation();
+  if(want === appliedCanvasRot){ pendingRot = null; return; }
+  const now = performance.now();
+  if(pendingRot !== want){ pendingRot = want; pendingRotSince = now; return; }
+  if(now - pendingRotSince < ROT_SETTLE_MS) return;
+  pendingRot = null;
+  appliedCanvasRot = want;
+  applyCanvasRotation();
 }
 
 /* -------------------------------------------------------------------------
@@ -552,27 +579,30 @@ function canvasRotation(){
    settle, rather than following it round.
    ------------------------------------------------------------------------- */
 const MAX_YAW_STEP = THREE.MathUtils.degToRad(60);
-const YAW_HOLD_MS  = 700;
-let yawState = null, yawHoldUntil = 0;
+let yawPrevRaw = null, yawFix = 0;
 
 function stableLegacyYaw(){
   _euler.setFromQuaternion(legacyQ, 'YXZ');
   const want = (invertYaw ? -1 : 1) * _euler.y;
-  if(yawState === null){ yawState = want; return yawState; }
+  if(yawPrevRaw === null){ yawPrevRaw = want; return wrapPi(want + yawFix); }
 
-  const delta = wrapPi(want - yawState);
-  const now = performance.now();
+  const delta = wrapPi(want - yawPrevRaw);
+  yawPrevRaw = want;
   if(Math.abs(delta) > MAX_YAW_STEP){
-    if(!yawHoldUntil) yawHoldUntil = now + YAW_HOLD_MS;
-    if(now < yawHoldUntil) return yawState;      // ride out the transient
+    // Absorb the jump into a permanent offset rather than holding and then
+    // releasing it — holding only delays the snap, it doesn't remove it.
+    // Taking it into the offset means the output never moves at all, and
+    // when alpha catches up and jumps back, that is absorbed too.
+    yawFix = wrapPi(yawFix - delta);
   }
-  yawHoldUntil = 0;
-  yawState = wrapPi(yawState + delta);
-  return yawState;
+  return wrapPi(want + yawFix);
 }
 
 /* --- compose the final head orientation ---------------------------------
    Pass dt to ease into the new orientation; omit it to snap immediately. */
+const MAX_FRAME_JUMP = THREE.MathUtils.degToRad(70);
+const MAX_REJECT_RUN = 20;           // ~330ms, then accept: never freeze the view
+let glitchesRejected = 0, rejectRun = 0;
 const SMOOTH_RATE = 42;              // 1/s — time constant ~24ms: enough to hide
                                      // frame-to-frame stepping, short enough that
                                      // it does not read as tracking lag
@@ -612,7 +642,24 @@ function updateHeadOrientation(dt){
     headQ.setFromEuler(_euler);
   }
 
-  // Ease rather than step. Short enough (~36ms) that it does not read as lag,
+  // Catch-all guard. Whatever the source — a sensor glitch, an encoding
+  // switch, an axis flip — the head simply cannot rotate this far between two
+  // frames (70° in one frame is >4000°/s). If it claims to, that is bad data,
+  // not head movement, so ignore the frame rather than snapping the view.
+  if(headInit && dt !== undefined){
+    const jump = head.quaternion.angleTo(headQ);
+    if(jump > MAX_FRAME_JUMP && rejectRun < MAX_REJECT_RUN){
+      // Looks like bad data — skip this frame. But never reject forever: if
+      // the new orientation persists it is real, so after a few hundred ms
+      // stop rejecting and let the easing below carry us there smoothly
+      // rather than leaving the view frozen.
+      rejectRun++; glitchesRejected++;
+      return;
+    }
+    if(jump <= MAX_FRAME_JUMP) rejectRun = 0;
+  }
+
+  // Ease rather than step. Short enough (~24ms) that it does not read as lag,
   // long enough that nothing in the view ever jumps a frame at a time.
   if(dt === undefined || !headInit){
     head.quaternion.copy(headQ);
@@ -626,7 +673,12 @@ function updateHeadOrientation(dt){
 // re-measure how the phone is sitting in the headset.
 function recentreView(){
   const remeasured = calibrateMount();
-  if(remeasured) applyCanvasRotation();
+  if(remeasured){
+    appliedCanvasRot = desiredCanvasRotation();   // deliberate: adopt at once
+    pendingRot = null;
+    applyCanvasRotation();
+  }
+  headInit = false;                     // a recentre is deliberate: let it snap
   updateHeadOrientation();
   _euler.setFromQuaternion(head.quaternion, 'YXZ');
   qYawOffset.premultiply(_qa.setFromAxisAngle(_yAxis, -_euler.y));
@@ -838,7 +890,7 @@ function runCalibration(seconds = 6){
       // If the canvas had to be rotated, iOS kept the page portrait while the
       // phone is sideways — i.e. Portrait Orientation Lock is on. The 3D view
       // is corrected, but the buttons/text overlays cannot rotate with it.
-      const locked = canvasRotation() !== 0;
+      const locked = appliedCanvasRot !== 0;
       let msg;
       if(!ok) msg = 'Could not calibrate — hold the phone upright, then tap Recentre';
       else if(locked) msg = '✓ Calibrated<br><br><b>Turn off Portrait Orientation Lock</b><br>' +
@@ -978,7 +1030,8 @@ addEventListener('pointerdown', e=>{
 // in the headset, we draw a landscape buffer and rotate the canvas element
 // itself with CSS — so all the stereo/viewport logic below stays unchanged.
 function applyCanvasRotation(){
-  const r = canvasRotation();
+  screenAngle = readScreenAngle();     // never depend on listener ordering
+  const r = appliedCanvasRot;
   const quarterTurned = Math.abs(Math.round(r / HALF_PI)) % 2 === 1;
   viewW = quarterTurned ? innerHeight : innerWidth;
   viewH = quarterTurned ? innerWidth  : innerHeight;
@@ -1004,7 +1057,7 @@ function layoutPad(){
 
 function resize(){
   layoutPad();
-  const r = canvasRotation();
+  const r = appliedCanvasRot;
   const quarterTurned = Math.abs(Math.round(r / HALF_PI)) % 2 === 1;
   viewW = quarterTurned ? innerHeight : innerWidth;
   viewH = quarterTurned ? innerWidth  : innerHeight;
@@ -1015,7 +1068,6 @@ function resize(){
   if(stereo) rebuildRenderTargets();
 }
 addEventListener('resize', ()=>applyCanvasRotation());
-addEventListener('orientationchange', ()=>{ applyCanvasRotation(); setTimeout(applyCanvasRotation, 200); });
 applyCanvasRotation();
 
 /* =========================================================================
@@ -1312,6 +1364,7 @@ function updateMovement(dt){
 renderer.setAnimationLoop(()=>{
   const dt = Math.min(clock.getDelta(), 0.05);
 
+  settleCanvasRotation();
   updateHeadOrientation(dt);
 
   if(modelLoaded) updateMovement(dt);
@@ -1351,8 +1404,8 @@ renderer.setAnimationLoop(()=>{
       `sensor beta:${lastBetaDeg.toFixed(0)} gamma:${lastGammaDeg.toFixed(0)} alpha:${lastHeadingDeg.toFixed(0)}\n` +
       `grav  ${gravDev.x.toFixed(2)},${gravDev.y.toFixed(2)},${gravDev.z.toFixed(2)}\n` +
       `mount:${mountAngle===null?'uncal':R(mountAngle).toFixed(0)+'°'} scr:${screenAngle}° ` +
-      `canvasRot:${R(canvasRotation()).toFixed(0)}°\n` +
-      `view ${viewW}x${viewH} win ${innerWidth}x${innerHeight}\n` +
+      `canvasRot:${R(appliedCanvasRot).toFixed(0)}°/${R(desiredCanvasRotation()).toFixed(0)}°\n` +
+      `view ${viewW}x${viewH} win ${innerWidth}x${innerHeight} rej:${glitchesRejected}\n` +
       `pos ${rig.position.x.toFixed(2)},${rig.position.y.toFixed(2)},${rig.position.z.toFixed(2)} ` +
       `col:${colCount}\n` +
       `key:${lastKeyLabel.slice(0,34)}`;

@@ -363,17 +363,18 @@ console.log('    they do not. Raw heading vs the de-glitched heading:');
   }
   const yawOf = q => new THREE.Euler().setFromQuaternion(q, 'YXZ').y;
 
-  // the same de-glitcher as index.html
+  // the same de-glitcher as index.html: absorb an impossible jump into a
+  // permanent offset, so the output never moves and later corrections
+  // (alpha catching up, or jumping back) are absorbed too
   const MAX_YAW_STEP = 60 * D2R;
-  let yawState = null, holding = false;
   const wrapRad = a => Math.atan2(Math.sin(a), Math.cos(a));
+  let prevRaw = null, fix = 0;
   function stableYaw(want) {
-    if (yawState === null) { yawState = want; return yawState; }
-    const delta = wrapRad(want - yawState);
-    if (Math.abs(delta) > MAX_YAW_STEP) { holding = true; return yawState; }
-    holding = false;
-    yawState = wrapRad(yawState + delta);
-    return yawState;
+    if (prevRaw === null) { prevRaw = want; return wrapRad(want + fix); }
+    const delta = wrapRad(want - prevRaw);
+    prevRaw = want;
+    if (Math.abs(delta) > MAX_YAW_STEP) fix = wrapRad(fix - delta);
+    return wrapRad(want + fix);
   }
 
   const seq = [
@@ -383,21 +384,31 @@ console.log('    they do not. Raw heading vs the de-glitched heading:');
     [-90, -180,  70, 'up 20'],
     [-90, -180,  60, 'up 30'],
   ];
-  let worstRawJump = 0, worstStableJump = 0, prevRaw = null, prevStable = null;
+  let worstRawJump = 0, worstStableJump = 0, lastRaw = null, prevStable = null;
   for (const [a, b, g, label] of seq) {
     const raw = yawOf(legacyHeadMounted(a, b, g));
     const stable = stableYaw(raw);
-    const rawJump    = prevRaw    === null ? 0 : Math.abs(wrapRad(raw - prevRaw)) * R2D;
+    const rawJump    = lastRaw    === null ? 0 : Math.abs(wrapRad(raw - lastRaw)) * R2D;
     const stableJump = prevStable === null ? 0 : Math.abs(wrapRad(stable - prevStable)) * R2D;
     worstRawJump = Math.max(worstRawJump, rawJump);
     worstStableJump = Math.max(worstStableJump, stableJump);
     console.log(`    ${label.padEnd(22)} raw ${(raw*R2D).toFixed(0).padStart(5)}°  (jump ${rawJump.toFixed(0).padStart(3)}°)   ` +
                 `stable ${(stable*R2D).toFixed(0).padStart(4)}°  (jump ${stableJump.toFixed(0)}°)`);
-    prevRaw = raw; prevStable = stable;
+    lastRaw = raw; prevStable = stable;
   }
   console.log(`    worst heading jump — raw: ${worstRawJump.toFixed(0)}°   de-glitched: ${worstStableJump.toFixed(0)}°`);
   ok(worstRawJump > 170, 'expected the raw heading to flip ~180 degrees');
   ok(worstStableJump < 1, 'de-glitched heading should not jump at all');
+
+  // a real head turn arrives in small increments and must track exactly
+  prevRaw = null; fix = 0;
+  let worstErr = 0;
+  for (let deg = 0; deg <= 180; deg += 4) {
+    const out = stableYaw(deg * D2R) * R2D;
+    worstErr = Math.max(worstErr, Math.abs(wrapRad((out - deg) * D2R)) * R2D);
+  }
+  console.log(`    a genuine 0->180° turn in 4° steps tracks with max error ${worstErr.toFixed(2)}°`);
+  ok(worstErr < 0.01, 'real head turning must pass through untouched');
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

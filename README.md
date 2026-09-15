@@ -66,9 +66,30 @@ the view snapping round to face backwards precisely as you look up.
 
 That step is physically impossible between two samples (it would be thousands
 of degrees per second), so it's now recognised for what it is — an encoding
-artefact, not a head movement — and the last good heading is held until the
-values settle. Verified in check 12: raw heading jumps 180°, de-glitched
-heading jumps 0°.
+artefact, not a head movement — and absorbed into a permanent offset so the
+view never moves at all. Absorbing rather than *holding* matters: holding only
+postpones the snap, absorbing removes it, and when alpha catches up and jumps
+back that is absorbed too. Verified in check 12: raw heading jumps 180°,
+de-glitched heading jumps 0°, while a genuine 0→180° turn in small steps
+passes through with 0.00° error.
+
+**The bigger cause of the abrupt flips was elsewhere, though.** The canvas
+rotation was being recomputed live from `screen.orientation.angle` — and
+tilting a phone towards flat, which is exactly what looking down or up in a
+headset does, makes iOS re-evaluate device orientation and fire
+`orientationchange`. That flipped the reported angle by 90° or 180°
+mid-session and snapped the entire view round with it. It happened in *both*
+tracking modes, which is why fixing the heading alone didn't help.
+
+The phone cannot actually move inside the headset, so a change there is
+almost always a spurious re-evaluation. It now has to hold steady for 600ms
+before it's believed: transient flaps are ignored entirely, a genuine
+sustained change is still adopted. Verified both ways.
+
+Finally there's a catch-all: the head cannot rotate more than 70° between two
+frames (that would be >4000°/s), so any frame claiming otherwise is dropped —
+whatever the cause. It gives up after ~330ms so a real change can never leave
+the view frozen. Normal head turning triggers it zero times.
 
 Separately, every orientation change now eases in over ~24ms instead of being
 applied in one step, so nothing in the view moves a whole frame at a time.
