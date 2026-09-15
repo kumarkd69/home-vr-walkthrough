@@ -463,5 +463,49 @@ console.log('    limit as you look up. Heading from direction vectors is not.');
   ok(worstDisagree < 0.01, 'vector heading must match Euler in the well-conditioned range');
 }
 
+console.log('\n14. A SMEARED heading flip. webkitCompassHeading is the bearing of the');
+console.log('    device\'s top edge — undefined as that edge nears vertical, so it');
+console.log('    swings 180° when you look up. The magnetometer filter spreads that');
+console.log('    over several samples, so a fixed per-sample threshold misses it:');
+{
+  const D = d => d * D2R, deg = r => r * R2D;
+  const wrapRad = a => Math.atan2(Math.sin(a), Math.cos(a));
+
+  function makeLimiter({ fixedStep, rateLimit }) {
+    let prev = null, fix = 0;
+    return want => {
+      if (prev === null) { prev = want; return wrapRad(want + fix); }
+      const delta = wrapRad(want - prev);
+      prev = want;
+      const limit = fixedStep !== undefined
+        ? fixedStep
+        : Math.max(rateLimit * (1 / 60), D(15));
+      if (Math.abs(delta) > limit) fix = wrapRad(fix - delta);
+      return wrapRad(want + fix);
+    };
+  }
+
+  // 180 degrees smeared over 5 samples = 36 deg each: under a 60 deg threshold
+  const smeared = [0, 36, 72, 108, 144, 180, 180, 180].map(D);
+  const oldWay = makeLimiter({ fixedStep: D(60) });
+  const newWay = makeLimiter({ rateLimit: D(400) });
+  const oldOut = smeared.map(v => Math.abs(deg(oldWay(v))));
+  const newOut = smeared.map(v => Math.abs(deg(newWay(v))));
+  console.log(`    old fixed 60° threshold -> heading reaches ${Math.max(...oldOut).toFixed(0)}°`);
+  console.log(`    new rate limit          -> heading reaches ${Math.max(...newOut).toFixed(0)}°`);
+  ok(Math.max(...oldOut) > 90, 'expected the fixed threshold to let the smeared flip through');
+  ok(Math.max(...newOut) < 1, 'rate limit must absorb a smeared flip entirely');
+
+  // ...while a real head turn (300 deg/s = 5 deg per frame) passes untouched
+  const real = makeLimiter({ rateLimit: D(400) });
+  let worst = 0;
+  for (let i = 0; i <= 36; i++) {
+    const want = D(i * 5);
+    worst = Math.max(worst, Math.abs(deg(wrapRad(real(want) - want))));
+  }
+  console.log(`    a real 300°/s turn passes through with max error ${worst.toFixed(2)}°`);
+  ok(worst < 0.01, 'a real head turn must not be rate limited');
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

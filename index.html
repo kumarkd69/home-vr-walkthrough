@@ -361,8 +361,22 @@ function handleOrientation(e){
   ).normalize();
   gravValid = true;
 
-  if (typeof e.webkitCompassHeading === 'number') lastHeadingDeg = 360 - e.webkitCompassHeading;
-  else if (e.alpha != null) lastHeadingDeg = e.alpha;
+  // Use ALPHA, not webkitCompassHeading.
+  //
+  // This was the cause of the view swinging round to face backwards when you
+  // looked up. webkitCompassHeading is Apple's compass bearing of the device's
+  // top edge — it is NOT alpha, and `alpha = 360 - heading` only holds while
+  // the phone is roughly flat or upright. In a headset, looking up swings that
+  // top edge towards vertical, where its bearing is undefined, so the value
+  // swings a full 180 degrees as you cross the horizon. Substituting it into
+  // the alpha slot of Rz(alpha)Rx(beta)Ry(gamma) then rotates the whole world.
+  // Reproduced: yaw went 0 -> 71 -> 144 degrees the moment pitch went positive.
+  //
+  // alpha is the quantity this composition actually wants, and iOS reports it
+  // alongside the compass heading. We never needed true north anyway —
+  // Recentre defines which way "forward" is.
+  if (e.alpha != null) lastHeadingDeg = e.alpha;
+  else if (typeof e.webkitCompassHeading === 'number') lastHeadingDeg = 360 - e.webkitCompassHeading;
 
   // Composition of the raw alpha/beta/gamma. Used as a selectable fallback for
   // the whole orientation, and — more importantly — as the only available
@@ -611,16 +625,23 @@ function headingOf(q){
   return Math.atan2(-x, -z);                 // 0 = facing -Z
 }
 
-const MAX_YAW_STEP = THREE.MathUtils.degToRad(60);
+// A head turns at a few hundred degrees a second at most. Anything faster than
+// this is the heading source misbehaving, not you moving — and crucially this
+// catches a swing smeared across several samples, which a fixed per-sample
+// threshold lets straight through (a filtered magnetometer flip arrives as
+// ~36°/sample for five samples, not as one 180° jump).
+const MAX_YAW_RATE = THREE.MathUtils.degToRad(400);   // per second
+const MIN_YAW_STEP = THREE.MathUtils.degToRad(15);    // floor, for slow sample rates
 let yawPrevRaw = null, yawFix = 0;
 
-function stableLegacyYaw(){
+function stableLegacyYaw(dt){
   const want = (invertYaw ? -1 : 1) * headingOf(legacyQ);
   if(yawPrevRaw === null){ yawPrevRaw = want; return wrapPi(want + yawFix); }
 
   const delta = wrapPi(want - yawPrevRaw);
   yawPrevRaw = want;
-  if(Math.abs(delta) > MAX_YAW_STEP){
+  const limit = Math.max(MAX_YAW_RATE * (dt || 0.016), MIN_YAW_STEP);
+  if(Math.abs(delta) > limit){
     // Absorb the jump into a permanent offset rather than holding and then
     // releasing it — holding only delays the snap, it doesn't remove it.
     // Taking it into the offset means the output never moves at all, and
@@ -659,7 +680,7 @@ function updateHeadOrientation(dt){
     // de-glitched as above.
     if(!gyroAvailable && legacyValid){
       const have = headingOf(headQ);
-      const want = stableLegacyYaw();
+      const want = stableLegacyYaw(dt);
       headQ.premultiply(_qb.setFromAxisAngle(_yAxis, wrapPi(want - have)));
     }
   } else {
