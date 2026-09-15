@@ -35,16 +35,45 @@ so on screen.
 
 There's no controller, so movement is driven by where you're looking:
 
-- Look **down** past ~18° → walk forward.
-- Look **up** past ~22° → walk backward.
-- Within about ±8° of level, you don't move — so normal looking around
-  doesn't drag you around the house.
+- Look **down** past ~18° → walk **towards whatever you were just looking at**.
+- Look anywhere else — level, up, sideways → you **stop**. Looking up is just
+  looking up; it never walks you backwards.
 - Toggle it off entirely with the **Gaze-walk** button if you just want to
   stand in one spot and look around.
+- To go **backwards**, use the ▼ button on screen, a bound remote button, or
+  S / down-arrow on a keyboard.
 - On a desktop browser, **WASD**/arrow keys move and strafe instead, and any
   connected Bluetooth gamepad/VR remote's left stick also works.
 
 Walking speed is 1.4 m/s by default (tweakable — see below).
+
+## Why the view flickered to a back view when you looked up
+
+The horizon is exactly where iOS has to switch how it encodes your
+orientation, and all three of alpha/beta/gamma jump by ~180° at the same
+moment:
+
+```
+head  0°  ->  alpha  90.0   beta    0.0   gamma -90.0
+head +5°  ->  alpha -90.0   beta -180.0   gamma +85.0
+```
+
+Composed together those jumps cancel perfectly — but only if all three land in
+the same sample. Alpha comes from the slower, heavily filtered magnetometer
+pipeline, so for a frame or two it hasn't caught up yet. Measured, with alpha
+lagging a single sample, the computed heading swings a **full 180° and back**:
+the view snapping round to face backwards precisely as you look up.
+
+That step is physically impossible between two samples (it would be thousands
+of degrees per second), so it's now recognised for what it is — an encoding
+artefact, not a head movement — and the last good heading is held until the
+values settle. Verified in check 12: raw heading jumps 180°, de-glitched
+heading jumps 0°.
+
+Separately, every orientation change now eases in over ~24ms instead of being
+applied in one step, so nothing in the view moves a whole frame at a time.
+That's short enough not to read as lag (an instantaneous 30° step settles in
+88ms; real head movement is continuous, so the practical lag is the 24ms).
 
 ## Using it without a headset (e.g. for parents)
 

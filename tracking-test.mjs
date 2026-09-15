@@ -348,5 +348,57 @@ console.log('    is why looking down walked you AWAY from what you were facing.'
   ok(right.x > 0.99, 'strafe right should be +X for a camera facing -Z');
 }
 
+console.log('\n12. THE LOOK-UP FLICKER: at the horizon all three angles switch');
+console.log('    representation at once. They cancel only if they arrive in the');
+console.log('    same sample — alpha (magnetometer) lags, so for a frame or two');
+console.log('    they do not. Raw heading vs the de-glitched heading:');
+{
+  const mountRad = -90 * D2R;
+  function legacyHeadMounted(a, b, g) {
+    const q = new THREE.Quaternion().setFromEuler(
+      new THREE.Euler(b * D2R, a * D2R, -g * D2R, 'YXZ'));
+    q.multiply(new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2));
+    q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), mountRad));
+    return q;
+  }
+  const yawOf = q => new THREE.Euler().setFromQuaternion(q, 'YXZ').y;
+
+  // the same de-glitcher as index.html
+  const MAX_YAW_STEP = 60 * D2R;
+  let yawState = null, holding = false;
+  const wrapRad = a => Math.atan2(Math.sin(a), Math.cos(a));
+  function stableYaw(want) {
+    if (yawState === null) { yawState = want; return yawState; }
+    const delta = wrapRad(want - yawState);
+    if (Math.abs(delta) > MAX_YAW_STEP) { holding = true; return yawState; }
+    holding = false;
+    yawState = wrapRad(yawState + delta);
+    return yawState;
+  }
+
+  const seq = [
+    [ 90,    0, -90, 'level'],
+    [ 90, -180,  85, 'up 5, alpha LAGGING'],
+    [-90, -180,  85, 'up 5, alpha caught up'],
+    [-90, -180,  70, 'up 20'],
+    [-90, -180,  60, 'up 30'],
+  ];
+  let worstRawJump = 0, worstStableJump = 0, prevRaw = null, prevStable = null;
+  for (const [a, b, g, label] of seq) {
+    const raw = yawOf(legacyHeadMounted(a, b, g));
+    const stable = stableYaw(raw);
+    const rawJump    = prevRaw    === null ? 0 : Math.abs(wrapRad(raw - prevRaw)) * R2D;
+    const stableJump = prevStable === null ? 0 : Math.abs(wrapRad(stable - prevStable)) * R2D;
+    worstRawJump = Math.max(worstRawJump, rawJump);
+    worstStableJump = Math.max(worstStableJump, stableJump);
+    console.log(`    ${label.padEnd(22)} raw ${(raw*R2D).toFixed(0).padStart(5)}°  (jump ${rawJump.toFixed(0).padStart(3)}°)   ` +
+                `stable ${(stable*R2D).toFixed(0).padStart(4)}°  (jump ${stableJump.toFixed(0)}°)`);
+    prevRaw = raw; prevStable = stable;
+  }
+  console.log(`    worst heading jump — raw: ${worstRawJump.toFixed(0)}°   de-glitched: ${worstStableJump.toFixed(0)}°`);
+  ok(worstRawJump > 170, 'expected the raw heading to flip ~180 degrees');
+  ok(worstStableJump < 1, 'de-glitched heading should not jump at all');
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

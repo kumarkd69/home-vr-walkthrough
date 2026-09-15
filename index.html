@@ -88,7 +88,7 @@
 </div>
 
 <div id="cal"></div>
-<div id="hud" class="hide">Look <b>down</b> to walk forward · <b>up</b> to walk back · controller stick also works</div>
+<div id="hud" class="hide">Look <b>down</b> to walk · look level to stop</div>
 <div id="dbg"></div>
 <button id="exit">✕ Exit VR</button>
 
@@ -152,9 +152,8 @@ const EYE_HEIGHT    = 1.6;                 // eye height in metres, fixed per fl
 // as Ground and Floor 1. Edit this array if your model differs.
 const FLOOR_HEIGHTS = [0.0, 3.56];
 const WALK_SPEED_DEFAULT   = 1.4;          // m/s
-const GAZE_DEADZONE_DEG    = 8;            // no movement inside this pitch band
-const GAZE_FWD_THRESH_DEG  = 18;           // pitch below -this triggers forward (looking down)
-const GAZE_BACK_THRESH_DEG = 22;           // pitch above +this triggers backward (looking up)
+const GAZE_FWD_THRESH_DEG  = 18;           // look down past this many degrees to walk forward
+                                           // (looking up never walks you backwards — by design)
 const PLAYER_RADIUS  = 0.32;               // collision capsule radius, metres
 const IPD_DEFAULT     = 0.064;             // metres, cardboard default
 const DISTORT_K1_DEFAULT = 0.22;           // barrel distortion coefficients — tune per headset
@@ -532,8 +531,54 @@ function canvasRotation(){
   return Math.round(r / HALF_PI) * HALF_PI;     // snap to a right angle
 }
 
-/* --- compose the final head orientation --------------------------------- */
-function updateHeadOrientation(){
+/* -------------------------------------------------------------------------
+   De-glitched yaw.
+
+   Crossing the horizon is where alpha/beta/gamma switch representation — all
+   three jump by roughly 180 degrees at once, e.g.
+
+       head  0 deg  ->  alpha  90.0  beta    0.0  gamma -90.0
+       head +5 deg  ->  alpha -90.0  beta -180.0  gamma +85.0
+
+   Composed together those jumps cancel exactly... but only if all three
+   arrive in the same sample. Alpha comes from the slower, heavily filtered
+   magnetometer pipeline, so for a frame or two it does not, and the composed
+   heading swings wildly — the view snapping round to face backwards just as
+   you look up.
+
+   A yaw step that big between two samples is physically impossible (it would
+   be thousands of degrees per second), so treat it as what it is — a
+   representation artefact — and hold the last good heading until the values
+   settle, rather than following it round.
+   ------------------------------------------------------------------------- */
+const MAX_YAW_STEP = THREE.MathUtils.degToRad(60);
+const YAW_HOLD_MS  = 700;
+let yawState = null, yawHoldUntil = 0;
+
+function stableLegacyYaw(){
+  _euler.setFromQuaternion(legacyQ, 'YXZ');
+  const want = (invertYaw ? -1 : 1) * _euler.y;
+  if(yawState === null){ yawState = want; return yawState; }
+
+  const delta = wrapPi(want - yawState);
+  const now = performance.now();
+  if(Math.abs(delta) > MAX_YAW_STEP){
+    if(!yawHoldUntil) yawHoldUntil = now + YAW_HOLD_MS;
+    if(now < yawHoldUntil) return yawState;      // ride out the transient
+  }
+  yawHoldUntil = 0;
+  yawState = wrapPi(yawState + delta);
+  return yawState;
+}
+
+/* --- compose the final head orientation ---------------------------------
+   Pass dt to ease into the new orientation; omit it to snap immediately. */
+const SMOOTH_RATE = 42;              // 1/s — time constant ~24ms: enough to hide
+                                     // frame-to-frame stepping, short enough that
+                                     // it does not read as tracking lag
+let headInit = false;
+
+function updateHeadOrientation(dt){
   if(!gyroOn){
     head.quaternion.setFromEuler(_euler.set(pitch, yaw, 0, 'YXZ'));
     return;
@@ -548,12 +593,13 @@ function updateHeadOrientation(){
     // Gravity gives pitch and roll but says nothing about which way you are
     // facing — rotating about the vertical axis doesn't move gravity at all.
     // So with no gyroscope yaw would never change and you simply could not
-    // look left or right. Borrow yaw from the alpha/beta/gamma composition.
+    // look left or right. Borrow yaw from the alpha/beta/gamma composition,
+    // de-glitched as above.
     if(!gyroAvailable && legacyValid){
-      _euler.setFromQuaternion(headQ,  'YXZ'); const have = _euler.y;
-      _euler.setFromQuaternion(legacyQ,'YXZ');
-      const want = (invertYaw ? -1 : 1) * _euler.y;
-      headQ.premultiply(_qb.setFromAxisAngle(_yAxis, want - have));
+      _euler.setFromQuaternion(headQ, 'YXZ');
+      const have = _euler.y;
+      const want = stableLegacyYaw();
+      headQ.premultiply(_qb.setFromAxisAngle(_yAxis, wrapPi(want - have)));
     }
   } else {
     headQ.copy(legacyQ);
@@ -565,7 +611,15 @@ function updateHeadOrientation(){
     _euler.x = -_euler.x;
     headQ.setFromEuler(_euler);
   }
-  head.quaternion.copy(headQ);
+
+  // Ease rather than step. Short enough (~36ms) that it does not read as lag,
+  // long enough that nothing in the view ever jumps a frame at a time.
+  if(dt === undefined || !headInit){
+    head.quaternion.copy(headQ);
+    headInit = true;
+  } else {
+    head.quaternion.slerp(headQ, 1 - Math.exp(-dt * SMOOTH_RATE));
+  }
 }
 
 // Recentre: make wherever you're looking right now the new "forward", and
@@ -961,7 +1015,7 @@ function resize(){
   if(stereo) rebuildRenderTargets();
 }
 addEventListener('resize', ()=>applyCanvasRotation());
-addEventListener('orientationchange', ()=>setTimeout(()=>applyCanvasRotation(), 150));
+addEventListener('orientationchange', ()=>{ applyCanvasRotation(); setTimeout(applyCanvasRotation, 200); });
 applyCanvasRotation();
 
 /* =========================================================================
@@ -1189,10 +1243,10 @@ function updateMovement(dt){
 
   if(autoWalk){
     // Looking down walks you TOWARDS whatever you were just looking at.
+    // Looking up does NOT walk you backwards — it just looks up. Use the
+    // on-screen pad, a bound remote button or S/down-arrow to go back.
     const pitchDeg = THREE.MathUtils.radToDeg(currentPitchRad()) * (gazeSwap ? -1 : 1);
-    if(pitchDeg < -GAZE_FWD_THRESH_DEG) v = 1;         // looking down past threshold -> walk forward
-    else if(pitchDeg > GAZE_BACK_THRESH_DEG) v = -1;    // looking up past threshold -> walk backward
-    else if(Math.abs(pitchDeg) <= GAZE_DEADZONE_DEG) v = 0;
+    if(pitchDeg < -GAZE_FWD_THRESH_DEG) v = 1;
   }
 
   // desktop keyboard (and any remote that presents as a HID keyboard)
@@ -1258,7 +1312,7 @@ function updateMovement(dt){
 renderer.setAnimationLoop(()=>{
   const dt = Math.min(clock.getDelta(), 0.05);
 
-  updateHeadOrientation();
+  updateHeadOrientation(dt);
 
   if(modelLoaded) updateMovement(dt);
 
